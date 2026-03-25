@@ -9,6 +9,8 @@ if script_dir not in sys.path:
 from bl_IR import config
 from bl_IR import radiation
 
+GLOBAL_MIN = 2.0e6
+GLOBAL_MAX = 3.5e6
 
 def assign(obj, mesh, radiation_values, mode=config.OUTPUT_MODE):
     # -----------------------
@@ -22,6 +24,7 @@ def assign(obj, mesh, radiation_values, mode=config.OUTPUT_MODE):
 
     output = nodes.new("ShaderNodeOutputMaterial")
     emission = nodes.new("ShaderNodeEmission")
+    emission.inputs["Strength"].default_value = config.emission_strength * 2.0
     attr_rad = nodes.new("ShaderNodeAttribute")
     attr_rad.attribute_name = "Radiation"
 

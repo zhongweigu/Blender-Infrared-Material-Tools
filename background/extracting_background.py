@@ -5,7 +5,7 @@ import numpy as np
 
 # 路径设置
 images_dir = "images"             # 原始图像文件夹
-masks_dir = "masks"   # mask png 和 xml 所在文件夹
+masks_dir = "masks"               # mask png 和 xml 所在文件夹
 output_dir = "backgrounds"        # 输出背景图保存文件夹
 os.makedirs(output_dir, exist_ok=True)
 
@@ -20,7 +20,10 @@ for file in os.listdir(masks_dir):
         base = base_name(file)  # e.g. "Misc_1.png"
         mask_groups.setdefault(base, []).append(file)
 
-# 遍历每张图像
+# 排序，保证输出编号稳定
+mask_groups = dict(sorted(mask_groups.items()))
+
+counter = 1  # 从1开始编号
 for img_name, mask_files in mask_groups.items():
     img_path = os.path.join(images_dir, img_name)
     if not os.path.exists(img_path):
@@ -48,7 +51,12 @@ for img_name, mask_files in mask_groups.items():
     # inpaint 修复
     result = cv2.inpaint(img, mask_total, 3, cv2.INPAINT_TELEA)
 
+    # 生成新的文件名，例如 "000001.png"
+    new_name = f"{counter:06d}.png"
+    out_path = os.path.join(output_dir, new_name)
+
     # 保存结果
-    out_path = os.path.join(output_dir, img_name)
     cv2.imwrite(out_path, result)
     print(f"已处理: {img_name} -> {out_path}")
+
+    counter += 1

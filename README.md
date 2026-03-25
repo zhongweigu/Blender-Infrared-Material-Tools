@@ -19,6 +19,35 @@
 2. 将项目目录添加到sys目录
 3. 在 Blender 脚本编辑器中运行 `main.py`
 
+## 批量处理
+
+使用 `aircraft/batch_apply_ir.py` 批量为指定目录中的 .obj 模型应用红外材质。
+
+### 配置
+
+在脚本开头修改路径配置：
+
+```python
+SHAPENET_ROOT = r"你的模型路径"
+OUTPUT_DIR = r"输出目录"
+RENDER_IMAGE = False  # True 时同时渲染预览 PNG
+```
+
+### 运行
+
+命令行运行（需要 Blender 4.2）：
+
+```bash
+blender -b --python ./aircraft/batch_apply_ir.py
+```
+
+或在 Blender GUI 中打开脚本后 Alt+P 运行。
+
+### 输出
+
+- `.blend` 文件：每个模型一个，以模型 ID 命名
+- `_render.png`（可选）：渲染的 IR 图像
+
 ## 使用示例
 
 ```python

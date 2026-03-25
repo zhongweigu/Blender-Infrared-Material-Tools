@@ -6,7 +6,7 @@ import os
 import sys
 
 # 导入模块
-script_dir = os.path.dirname(bpy.data.filepath)
+script_dir = r"D:\codes\MTIR-Blender-InfraRed-Material-Tools\aircraft"
 if script_dir not in sys.path:
     sys.path.append(script_dir)
 from bl_IR import config
@@ -17,7 +17,8 @@ from bl_IR import camera
 
 # 获取发动机位置
 pos_L, pos_R = location.get_engines_location()
-
+print("Pos_L:", pos_L)
+print("Pos_R:", pos_R)
 
 # -----------------------
 # 主要方法,应用红外材质
@@ -29,30 +30,43 @@ def apply_ir_material(obj_name, engine_heat_delta):
         return
 
     mesh = obj.data
-    radiation_values = []
     T_inf_K = config.ambient_temp_C + 273.15
+    cam_loc = np.array(config.CAMERA_POS)
 
-    # 遍历顶点
+    # ====== 调试容器 ======
+    stats = {
+        "R": [],
+        "E_self": [],
+        "E_sun": [],
+        "E_aero": [],
+        "E_jet": [],
+        "E_total_raw": [],
+        "E_cfd": [],
+        "tau": [],
+        "geom": [],
+        "final": []
+    }
+
     for v in mesh.vertices:
         v_world = np.array(obj.matrix_world @ v.co)
-        # ---------- 自身辐射 ----------
-        E_self = radiation.calculate(T_inf_K)  # 物体自身热辐射
 
-        # ---------- 太阳项 ----------
+        # ---------- 自身 ----------
+        E_self = radiation.calculate(T_inf_K)
+
+        # ---------- 太阳 ----------
         E_sun = 0.0
         if config.CONSIDER_SUN:
-            cos_theta = radiation.sun_rad(v)  # 假设返回 0~1
-            I_sun = 1360.0 * 0.7  # 简化：地球大气透过率 0.7
+            cos_theta = radiation.sun_rad(v)
+            I_sun = 1360.0 * 0.7
             E_sun = config.emissivity * I_sun * cos_theta
 
-        # ---------- 气动加热 ----------
+        # ---------- 气动 ----------
         E_aero = 0.0
         if config.CONSIDER_AERO:
             T_recover = radiation.recovery_temperature(T_inf_K)
             E_aero = radiation.calculate(T_recover) - radiation.calculate(T_inf_K)
-            # 航空热力学中 恢复温度（adiabatic wall temperature）
 
-        # ---------- 发动机喷流 ----------
+        # ---------- 发动机 ----------
         E_jet = 0.0
         if config.CONSIDER_AERO:
             dTL = radiation.engine_influence(v_world, pos_L, heat=200, decay=0.7)
@@ -60,48 +74,68 @@ def apply_ir_material(obj_name, engine_heat_delta):
             dT_jet = max(dTL, dTR)
             E_jet = radiation.calculate(T_inf_K + dT_jet) - radiation.calculate(T_inf_K)
 
-        # ---------- 总辐射 ----------
+        # ---------- 总 ----------
         E_total = E_self + E_sun + E_aero + E_jet
 
-        # CFD 修正
+        # ---------- CFD ----------
         T_cfd = radiation.cfd_analysis(obj_name, T_inf_K, v_world, pos_L, pos_R)
-        E_total = max(E_total, radiation.calculate(T_cfd))
+        E_cfd = radiation.calculate(T_cfd)
+        E_total = max(E_total, E_cfd)
 
-        # ---------- 大气修正 (考虑距离) ----------
+        # ---------- 距离 ----------
+        R = np.linalg.norm(cam_loc - v_world)
+
+        # ---------- 大气 ----------
         if config.USE_ATMOS_CORR:
+            tau_R = radiation.atmospheric_transmittance(R, kappa=config.KAPPA)
+            geom_factor = 1.0 / (1.0 + 0.001 * R * R)
+
             T_bg_K = config.T_BACKGROUND_C + 273.15
             E_bg = radiation.calculate(T_bg_K)
 
-            # 计算距离 (传感器位置 - 当前点位置)
-            cam_loc = np.array(config.CAMERA_POS)  # 需要在 config 里定义
-            R = np.linalg.norm(cam_loc - v_world)
-
-            tau_R = radiation.atmospheric_transmittance(R, kappa=config.KAPPA)
-
-            # 几何扩散项
-            geom_factor = 1.0 / (1.0 + 0.001*R*R)
-
-            rad = tau_R * E_total * geom_factor + (1.0 - tau_R) * E_bg
+            rad = tau_R * E_total * geom_factor + (1 - tau_R) * E_bg
         else:
+            tau_R = 1.0
+            geom_factor = 1.0
             rad = E_total
 
-        # ---------- 传感器噪声 ----------
+        # ---------- 噪声 ----------
         if config.CONSIDER_NOISE:
-            noise_sigma = config.NOISE_LEVEL * rad  # 例如 5% 噪声
+            noise_sigma = config.NOISE_LEVEL * rad
             rad += np.random.normal(0, noise_sigma)
 
-        radiation_values.append(rad)
+        # ====== 收集数据 ======
+        stats["R"].append(R)
+        stats["E_self"].append(E_self)
+        stats["E_sun"].append(E_sun)
+        stats["E_aero"].append(E_aero)
+        stats["E_jet"].append(E_jet)
+        stats["E_total_raw"].append(E_self + E_sun + E_aero + E_jet)
+        stats["E_cfd"].append(E_cfd)
+        stats["tau"].append(tau_R)
+        stats["geom"].append(geom_factor)
+        stats["final"].append(rad)
 
-    # 控制台输出范围
-    min_rad = min(radiation_values)
-    max_rad = max(radiation_values)
-    print(f"[{obj_name}] 辐射强度范围: {min_rad:.3e} 到 {max_rad:.3e} W/m²")
+    # ====== 打印统计 ======
+    def log_stat(name, arr):
+        arr = np.array(arr)
+        print(f"{name:12s} | min={arr.min():.3e} max={arr.max():.3e} mean={arr.mean():.3e}")
 
-    # -----------------------
-    # 创建材质
-    # -----------------------
-    material.assign(obj, mesh, radiation_values)
-    print(f"[{obj_name}] 红外热成像材质已应用")
+    print(f"\n===== DEBUG: {obj_name} =====")
+    log_stat("R", stats["R"])
+    log_stat("E_self", stats["E_self"])
+    log_stat("E_sun", stats["E_sun"])
+    log_stat("E_aero", stats["E_aero"])
+    log_stat("E_jet", stats["E_jet"])
+    log_stat("E_total", stats["E_total_raw"])
+    log_stat("E_cfd", stats["E_cfd"])
+    log_stat("tau", stats["tau"])
+    log_stat("geom", stats["geom"])
+    log_stat("FINAL", stats["final"])
+
+    # ====== 应用材质 ======
+    material.assign(obj, mesh, stats["final"])
+
 
 
 # -----------------------
@@ -116,5 +150,5 @@ for name in ["Aircraft", "Engin_L", "Engin_R"]:
 for name, eng_delta in config.obj_names.items():
     apply_ir_material(name, eng_delta)
 
-camera.render_ir_image("//ir_render.png", cam_location=config.CAMERA_POS,
-                       cam_rotation=(math.radians(60), 0, math.radians(30)))
+# camera.render_ir_image("//ir_render.png", cam_location=config.CAMERA_POS,
+#                        cam_rotation=(math.radians(60), 0, math.radians(30)))

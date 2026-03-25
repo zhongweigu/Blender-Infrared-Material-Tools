@@ -13,6 +13,8 @@ c = 2.99792458e8
 kB = 1.380649e-23
 wavelength = 10e-6  # 10 μm
 
+emission_strength = 245.0 # 整体辐射显示强度
+
 # 大气传输修正（可选）
 USE_ATMOS_CORR = True
 TAU = 0.85                # 透过率
@@ -33,7 +35,7 @@ forward_dir = np.array([0, 1, 0])
 OUTPUT_MODE = 1
 
 # 是否考虑温度场
-CONSIDER_CFD = False
+CONSIDER_CFD = True
 # ---------- 解析近似 CFD 场参数 ----------
 JET_CENTERLINE_DT0 = 100.0      # 发动机喷流中心线最大升温（K）
 JET_Y_DECAY = 15.0              # 沿 y 的指数衰减长度（m）
@@ -52,7 +54,7 @@ CONSIDER_NOISE = True
 NOISE_LEVEL = 0.05   # 噪声水平 (5% 标准差)
 
 # 传感器位置
-CAMERA_POS = (15.0, -30.0, 20.0)
+CAMERA_POS = (1.50, -3.00, 2.00)
 KAPPA = 0.01                      # 大气消光系数 (1/m)，典型值 0.005~0.05
 
 # 物体属性名及温度配置

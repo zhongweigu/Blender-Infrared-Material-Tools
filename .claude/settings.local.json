@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(\"D:/codes/MTIR-Blender-InfraRed-Material-Tools/.venv/Scripts/pip.exe\" install *)",
+      "Bash(D:/codes/MTIR-Blender-InfraRed-Material-Tools/.venv/Scripts/python.exe *)"
+    ]
+  }
+}

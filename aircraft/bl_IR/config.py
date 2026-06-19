@@ -59,7 +59,7 @@ KAPPA = 0.01                      # 大气消光系数 (1/m)，典型值 0.005~0
 
 # 物体属性名及温度配置
 obj_names = {
-    "Aircraft": 0.0,
-    "Engin_L": 140.0,
-    "Engin_R": 140.0
+    "Aircraft": 280.0,
+    "Engin_L": 420.0,
+    "Engin_R": 420.0
 }

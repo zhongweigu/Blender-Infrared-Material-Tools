@@ -27,7 +27,7 @@ OUTPUT_DIR = r"D:\codes\MTIR-Blender-InfraRed-Material-Tools\output"
 BL_IR_PATH = r"D:\codes\MTIR-Blender-InfraRed-Material-Tools\aircraft"
 
 # 是否渲染图像（可选）
-RENDER_IMAGE = False
+RENDER_IMAGE = True
 # ============== 配置结束 ==============
 
 

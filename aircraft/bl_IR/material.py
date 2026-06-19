@@ -59,13 +59,31 @@ def assign(obj, mesh, radiation_values, mode=config.OUTPUT_MODE):
     links.new(color_ramp.outputs["Color"], emission.inputs["Color"])
     links.new(emission.outputs["Emission"], output.inputs["Surface"])
 
-    # -----------------------
     # 写入顶点辐射
-    # -----------------------
-    if "Radiation" not in mesh.attributes:
-        mesh.attributes.new(name="Radiation", type='FLOAT', domain='POINT')
-    for i, rad in enumerate(radiation_values):
-        mesh.attributes["Radiation"].data[i].value = rad
+    if "Radiation" in mesh.attributes:
+        mesh.attributes.remove(mesh.attributes["Radiation"])
+
+    n_verts = len(mesh.vertices)
+    n_rads = len(radiation_values)
+    print(f"[material.assign] mesh顶点数={n_verts}, 辐射值数量={n_rads}")
+
+    if n_rads == 0:
+        print("[material.assign] 辐射值为空，跳过写入")
+        return
+
+    attr = mesh.attributes.new(name="Radiation", type='FLOAT', domain='POINT')
+    print(f"[material.assign] 属性data大小={len(attr.data)}")
+
+    if len(attr.data) == 0:
+        # 尝试强制更新mesh
+        mesh.update()
+        print(f"[material.assign] mesh.update()后, data大小={len(attr.data)}")
+
+    if len(attr.data) != n_rads:
+        print(f"[material.assign] 属性大小({len(attr.data)}) != 辐射值数量({n_rads})，无法写入")
+        return
+
+    attr.data.foreach_set('value', radiation_values)
 
     # -----------------------
     # 分配材质

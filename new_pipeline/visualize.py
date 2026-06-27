@@ -127,15 +127,16 @@ def _setup_color_ramp(color_ramp, mode):
 
     if mode == "thermal":
         els[0].position = 0.0
-        els[0].color = (0.0, 0.0, 0.5, 1.0)
+        els[0].color = (0.0, 0.0, 0.5, 1.0)  # 深蓝
         els[1].position = 1.0
-        els[1].color = (1.0, 0.0, 0.0, 1.0)
+        els[1].color = (1.0, 0.0, 0.0, 1.0)  # 红色
 
+        # 拉长低温区色标间距，让蓝→青→绿过渡更平滑
         stops = [
-            (0.15, (0.0, 0.5, 1.0, 1.0)),
-            (0.35, (0.0, 1.0, 0.0, 1.0)),
-            (0.60, (1.0, 1.0, 0.0, 1.0)),
-            (0.85, (1.0, 0.5, 0.0, 1.0)),
+            (0.25, (0.0, 0.5, 1.0, 1.0)),   # 青色（从0.15移到0.25）
+            (0.45, (0.0, 1.0, 0.0, 1.0)),   # 绿色（从0.35移到0.45）
+            (0.65, (1.0, 1.0, 0.0, 1.0)),   # 黄色（从0.60移到0.65）
+            (0.85, (1.0, 0.5, 0.0, 1.0)),   # 橙色（保持不变）
         ]
         for pos, color in stops:
             el = els.new(pos)
@@ -195,9 +196,24 @@ def setup_camera(cam_location, target=(0, 0, 2),
     return cam
 
 
+def set_white_background():
+    """Set world background to pure white for rendering."""
+    scene = bpy.context.scene
+    world = scene.world
+    if world and world.use_nodes:
+        bg_node = world.node_tree.nodes.get('Background')
+        if bg_node:
+            bg_node.inputs['Color'].default_value = (1, 1, 1, 1)
+            bg_node.inputs['Strength'].default_value = 1.0
+
+
 def render_to_file(output_path):
-    """Render current scene to PNG."""
+    """Render current scene to PNG with white background."""
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+
+    # 设置白色背景
+    set_white_background()
+
     scene = bpy.context.scene
     scene.render.filepath = output_path
     bpy.ops.render.render(write_still=True)

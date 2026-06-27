@@ -129,6 +129,46 @@ def build_weights(G_flat, offsets):
     return weights
 
 
+def build_distance_weighted_G(offsets, indices, edge_lens, typical_len=None):
+    """基于边长度计算热导 G_ij = typical_len / d_ij.
+
+    解决网格密度不均匀问题：
+    - 稀疏网格（机翼）：边长，G_ij > 1，扩散快
+    - 密集网格（机身）：边短，G_ij ≈ 1，扩散慢
+    - 效果：每迭代步的物理传播距离在各处一致
+
+    Args:
+        offsets: CSR 偏移数组
+        indices: CSR 邻接索引
+        edge_lens: CSR 边长度数组
+        typical_len: 典型边长度（用于归一化），None=自动取中位数
+
+    Returns:
+        G_flat: 热导数组（未归一化，需传入 build_weights）
+    """
+    total_edges = int(offsets[-1])
+    G_flat = np.empty(total_edges, dtype=np.float64)
+
+    # 自动计算典型边长度（中位数）
+    if typical_len is None:
+        pos_lens = edge_lens[edge_lens > 0]
+        if len(pos_lens) > 0:
+            typical_len = float(np.median(pos_lens))
+        else:
+            typical_len = 1.0
+
+    if typical_len < 1e-9:
+        typical_len = 1e-9
+
+    for k in range(total_edges):
+        d = float(edge_lens[k])
+        if d < 1e-9:
+            d = 1e-9
+        G_flat[k] = typical_len / d
+
+    return G_flat, typical_len
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 温度→辐射转换 (pipeline.md §9, 原文 (7) 式)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -405,21 +445,22 @@ def ensure_connectivity(neighbors, edge_lengths, centers, source_faces):
 
 
 def add_cross_boundary_bridges(neighbors, edge_lengths, centers, engine_mask,
-                                max_pairs=5, max_distance=5.0):
+                                max_pairs=5, max_distance=5.0, source_faces=None):
     """Add synthetic edges between engine and body faces for heat transfer.
 
     When the engine and body meshes are separate shells (no shared edges after
-    merge), heat cannot diffuse across the boundary. This function adds multiple
-    nearest-neighbor bridges in both directions (engine→body and body→engine),
-    creating a dense connection that allows robust heat propagation.
+    merge), heat cannot diffuse across the boundary. This function adds bridges
+    from ALL engine faces to nearby body faces (one direction), allowing heat
+    to propagate from engine to aircraft skin after heat spreads within engine.
 
     Args:
         neighbors: list of lists (mutated in place)
         edge_lengths: dict (mutated in place)
         centers: (N, 3) face centers in world space
         engine_mask: (N,) bool array, True for engine-origin faces
-        max_pairs: max bridges per face in each direction
+        max_pairs: max bridges per engine face
         max_distance: max bridge distance (m, real scale)
+        source_faces: ignored (kept for backward compatibility)
 
     Returns:
         n_bridges: number of unique bridge edges added
@@ -432,13 +473,13 @@ def add_cross_boundary_bridges(neighbors, edge_lengths, centers, engine_mask,
         return 0
 
     ac_centers = centers[ac_idx]
-    eng_centers = centers[eng_idx]
     added = set()
 
     k_eng_to_ac = min(max_pairs, len(ac_idx))
-    k_ac_to_eng = min(max_pairs, len(eng_idx))
 
-    # Engine → body: every engine face connects to K nearest body faces
+    # Engine → body: each engine face connects to K nearest body faces within max_distance
+    # This allows heat to transfer from engine (after spreading within engine mesh)
+    # to the aircraft body.
     for ei in eng_idx:
         dists = np.sum((ac_centers - centers[ei]) ** 2, axis=1)
         order = np.argsort(dists)[:k_eng_to_ac]
@@ -447,20 +488,6 @@ def add_cross_boundary_bridges(neighbors, edge_lengths, centers, engine_mask,
             if d < max_distance:
                 aj = int(ac_idx[ni])
                 key = (ei, aj) if ei < aj else (aj, ei)
-                added.add(key)
-
-    # Body → engine: body faces near engine connect back to K nearest engine faces
-    for ai in ac_idx:
-        dists = np.sum((eng_centers - centers[ai]) ** 2, axis=1)
-        min_d = float(np.sqrt(dists.min()))
-        if min_d > max_distance:
-            continue
-        order = np.argsort(dists)[:k_ac_to_eng]
-        for ni in order:
-            d = float(np.sqrt(dists[ni]))
-            if d < max_distance:
-                ej = int(eng_idx[ni])
-                key = (ai, ej) if ai < ej else (ej, ai)
                 added.add(key)
 
     # Apply bridges

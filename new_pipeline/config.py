@@ -13,6 +13,11 @@ MERGE_VERTEX_DIST = 0.0001    # 顶点合并距离（模型尺度），合并前
                               # 注意: 此值×MODEL_SCALE=实际合并距离。过大会导致薄壁结构(机翼)塌陷
 SYMMETRIZE_MESH = False       # 计算前将网格沿X=0强制对称化 (消除左右几何不对称)
 
+# ---------- 温度对称化 ----------
+SYMMETRIZE_TEMPERATURE = False  # 扩散后将温度场沿X=0对称化（左=右的平均值）
+                              # 解决Gauss-Seidel迭代方向偏差导致的左右温度不对称
+                              # 与SYMMETRIZE_MESH不同，只对称化温度值，不改变网格几何
+
 # ---------- 初始温度 ----------
 T_AIRCRAFT_INIT = 280.0     # 蒙皮远场/初始温度 (非热源面片均初始化为此值)
 
@@ -29,7 +34,7 @@ K_SKIN = 205.0              # 蒙皮导热系数 (W/(m·K))，铝 ≈ 205
 SKIN_THICKNESS = 0.002      # 蒙皮厚度 (m)，典型 2 mm
 
 # ---------- 环境参数 ----------
-T_AMB = 280.0               # 辐射 sink 环境温度 (K)
+T_AMB = 217.0               # 辐射 sink 环境温度 (K)
 Q_I = 0.0                   # 入射辐射项 (W)，基线设为 0
 
 # ---------- 物理常数 ----------
@@ -38,26 +43,39 @@ C1 = 3.7418e-16             # 第一辐射常数 2πhc² (W·m²)
 C2 = 1.4388e-2              # 第二辐射常数 hc/k (m·K)
 
 # ---------- 气动加热 ----------
-MACH_NUMBER = 0.8            # 飞行马赫数，摩擦升温 ΔT = T₀·0.16·M²
+MACH_NUMBER = 0.5            # 飞行马赫数，摩擦升温 ΔT = T₀·0.16·M²
 
 # ---------- 热源功率 ----------
-Q_O = 9.564                  # 发动机热功率 per 连接面片 (W)，固定值
+Q_O = 59.564                  # 发动机热功率 per 连接面片 (W)，固定值
+HEAT_SOURCE_COUNT = 2        # 每尾焰的热源面片数量（固定值，不是百分比）
+                              # 2-3片模拟热量从尾焰核心通过少数连接点传导
+CALIBRATE_Q_O = False         # 是否在计算前校准 q_o（使发动机均温 ≈ 350K）
+CALIBRATE_TARGET_TEMP = 350.0  # 校准目标温度 (K)
 
 # ---------- 求解器参数 ----------
 HEAT_SOURCE_TOL = 1e-3      # 热源求解器容差 (W)，对应 F(T) 残差
 DIFFUSION_TOL = 0.1         # 扩散迭代收敛容差 (K)
 MAX_ITERATIONS = 20000      # 扩散最大迭代次数
-DIFFUSION_DECAY = 0.0       # 扩散衰减系数 α ∈ [0,1)，每步向 T_AMB 衰减: T_new = (1-α)·ΣwT + α·T_amb
+DIFFUSION_DECAY = 0.001       # 扩散衰减系数 α ∈ [0,1)，每步向 T_AMB 衰减: T_new = (1-α)·ΣwT + α·T_amb
                               # 0=纯扩散，0.01=轻微衰减，越大热量随距离消散越快
 USE_EXTERNAL_COMPUTE = True # 是否使用外部 Python 进程加速 (需要 .venv 已安装 numpy/numba/scipy)
 
+# ---------- 扩散权重模式 ----------
+USE_DISTANCE_WEIGHTED_DIFFUSION = True  # True=边长度权重, False=算术平均权重
+                              # 边长度权重: G_ij = typical_len / d_ij，解决网格密度不均匀问题
+
 # ---------- 减面 ----------
-DECIMATE_RATIO = 1.0        # 面片缩减比例，1.0=不减, 0.15=保留15%面数
+DECIMATE_RATIO = 0.5        # 面片缩减比例，1.0=不减, 0.15=保留15%面数
                            # 大型网格建议设置 0.1-0.3 以加速计算
+
+# ---------- 扩面（细分） ----------
+SUBDIVIDE_LEVEL = 0       # 细分级别，0=不细分, 1=每面变4面, 2=每面变16面
+                           # 用于获得更精细的温度场分辨率
+                           # 注意: Level=1 面片数×4, Level=2 面片数×16, 计算时间相应增加
 
 # ---------- 跨边界桥接 ----------
 CROSS_BOUNDARY_MAX_PAIRS = 5      # 每发动机面片连接机身面片数
-CROSS_BOUNDARY_MAX_DISTANCE = 5.0 # 最大桥接距离 (m)
+CROSS_BOUNDARY_MAX_DISTANCE = 2.0 # 最大桥接距离 (m)
 
 # ---------- 辐射计算 ----------
 LAMBDA_1 = 8.0e-6           # 探测波段下限 8 μm → 真实 SI: 8×10⁻⁶ m
@@ -72,13 +90,21 @@ BETA_RATIO = 0.0              # 线放大率比 β'/β_p，远距离目标≈0
 DN_MIN = 0                     # 灰度输出下限 (DN)
 DN_MAX = 255                   # 灰度输出上限 (DN)
 
+# ---------- 温度色标范围 ----------
+T_VMIN = 220.0                 # 温度色标下限 (K)，对应蓝色端
+T_VMAX = 380.0                 # 温度色标上限 (K)，对应红色端
+                              # 范围200K，每色段约40-50K，过渡平滑
+
 # ---------- 输出保存 ----------
-SAVE_PROCESSED_BLEND = True                   # 处理完后是否保存 .blend 文件
+SAVE_PROCESSED_BLEND = False                   # 处理完后是否保存 .blend 文件
 PROCESSED_BLEND_SUFFIX = "_IR"                # 处理后文件的后缀 (例如 aircraft_IR.blend)
 
 # ---------- 过程图片输出 ----------
-PROCESS_IMAGES_ENABLED = False              # 是否输出管线各阶段的过程图片
+PROCESS_IMAGES_ENABLED = True              # 是否输出管线各阶段的过程图片
 PROCESS_IMAGES_DIR = "//process_images/"     # 过程图片输出目录 (// = .blend 所在目录)
+PROCESS_IMAGES_STEPS = []     # 要输出的步骤编号列表
+                              # 可选: "00"(模型), "01"(线框), "02"(扩散温度), "03"(气动温度), "04"(辐射)
+                              # 空列表 [] = 输出全部步骤
 
 # ---------- 渲染输出 ----------
 RENDER_ENABLED = False                       # 是否输出多视角辐射渲染图 (暂关闭)
@@ -95,10 +121,6 @@ RENDER_EMISSION_STRENGTH = 1.0           # Emission 着色器强度
 RENDER_BW_MIN_GRAY = 0.10                # 低温区灰度 (0-1)，0=纯黑, 0.25=深灰, 0.5=中灰, 1=纯白
                                           # 大气温度区域显示此灰度，而非纯黑
 RENDER_BW_GRAY_ZONE = 0.80              # 灰色区域范围 (0-1)，控制多少区域保持灰色
-                                          # 0.6 表示归一化值 0~0.6 都显示灰色，只有 0.6~1 过渡到白
-                                          # 增大此值 → 机身偏灰、发动机偏白（增强区分度）
-                                          # 减小此值 → 整体偏白（减少区分度）
-                                          # 建议设置 0.5-0.7
 RENDER_BW_SATURATION = 1.0               # 白色饱和度 (0-1)，1.0=纯白封顶, 0.8=微灰白色
 
 # ---------- 物体名称 ----------

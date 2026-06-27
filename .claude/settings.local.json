@@ -11,7 +11,8 @@
       "Bash(/d/environments/py3.8/python -c ' *)",
       "Bash(/d/environments/py3.8/python -c \"import py_compile; py_compile.compile\\('new_pipeline/config.py', doraise=True\\); py_compile.compile\\('new_pipeline/stats.py', doraise=True\\); py_compile.compile\\('new_pipeline/main.py', doraise=True\\); py_compile.compile\\('new_pipeline/compute_standalone.py', doraise=True\\); py_compile.compile\\('new_pipeline/calibrate_compute.py', doraise=True\\); print\\('All Syntax OK'\\)\")",
       "Bash(/d/environments/py3.8/python -c \"import py_compile; py_compile.compile\\('new_pipeline/config.py', doraise=True\\); py_compile.compile\\('new_pipeline/main.py', doraise=True\\); py_compile.compile\\('new_pipeline/compute_standalone.py', doraise=True\\); py_compile.compile\\('new_pipeline/calibrate_compute.py', doraise=True\\); py_compile.compile\\('new_pipeline/stats.py', doraise=True\\); print\\('Syntax OK'\\)\")",
-      "Bash(blender -b \"aircraft/aircraft_1.blend\" --python \"./new_pipeline/main.py\")"
+      "Bash(blender -b \"aircraft/aircraft_1.blend\" --python \"./new_pipeline/main.py\")",
+      "Bash(blender -b aircraft/aircraft_1.blend --python ./new_pipeline/main.py)"
     ]
   }
 }

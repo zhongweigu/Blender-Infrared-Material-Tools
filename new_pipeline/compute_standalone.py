@@ -31,6 +31,7 @@ if _proj_root not in sys.path:
 
 from new_pipeline.calibrate_compute import (
     build_weights,
+    build_distance_weighted_G,
     _gauss_seidel_sweep,
     _gauss_seidel_sweep_reverse,
     solve_heat_balance,
@@ -147,15 +148,38 @@ def main():
     beta_ratio = float(data.get('BETA_RATIO', 0.0))
     cross_max_pairs = int(data.get('CROSS_BOUNDARY_MAX_PAIRS', 5))
     cross_max_dist = float(data.get('CROSS_BOUNDARY_MAX_DISTANCE', 5.0))
+    use_distance_weighted = bool(data.get('USE_DISTANCE_WEIGHTED_DIFFUSION', True))
 
     # ── 重建邻接表 ──
     neighbors, edge_lengths = rebuild_adjacency(offsets, indices, edge_lens)
 
-    # ── 【关键】跨边界结构连接 ──
+    # ── 1. 热源面片识别 (先识别，再桥接) ──
+    print(f"\n[compute] 识别热源面片 (T_o={T_exhaust} K, Q_O={q_o:.4f} W)...")
+
+    n_engine = int(engine_mask.sum())
+    if n_engine == 0:
+        print("[compute] 错误: 无发动机面片")
+        data.close()
+        sys.exit(1)
+
+    n_source_per_exhaust = int(data.get('HEAT_SOURCE_COUNT', 2))
+    engine_indices = np.where(engine_mask)[0]
+
+    source_faces = set()
+    exhaust_positions = [exhaust_arr[i] for i in range(len(exhaust_arr))]
+    for ep in exhaust_positions:
+        dists = np.linalg.norm(centers[engine_indices] - ep, axis=1)
+        nearest = engine_indices[np.argsort(dists)[:n_source_per_exhaust]]
+        source_faces.update(nearest.tolist())
+
+    print(f"  热源面片: {len(source_faces)} (每尾焰 {n_source_per_exhaust})")
+
+    # ── 【关键】跨边界结构连接 (只从热源面片) ──
     print(f"\n[compute] 跨边界桥接 (max_pairs={cross_max_pairs}, max_dist={cross_max_dist:.1f} m)...")
     n_bridges = add_cross_boundary_bridges(
         neighbors, edge_lengths, centers, engine_mask,
-        max_pairs=cross_max_pairs, max_distance=cross_max_dist
+        max_pairs=cross_max_pairs, max_distance=cross_max_dist,
+        source_faces=source_faces
     )
     print(f"  跨边界桥接: {n_bridges} 条边")
 
@@ -175,27 +199,6 @@ def main():
         for k, j in enumerate(nbrs):
             new_indices[start + k] = j
             new_edge_lens[start + k] = edge_lengths.get((i, j), 1.0)
-
-    # ── 1. 热源面片识别 ──
-    print(f"\n[compute] 识别热源面片 (T_o={T_exhaust} K, Q_O={q_o:.4f} W)...")
-
-    n_engine = int(engine_mask.sum())
-    if n_engine == 0:
-        print("[compute] 错误: 无发动机面片")
-        data.close()
-        sys.exit(1)
-
-    n_source_per_exhaust = max(5, min(200, int(n_engine * 0.05)))
-    engine_indices = np.where(engine_mask)[0]
-
-    source_faces = set()
-    exhaust_positions = [exhaust_arr[i] for i in range(len(exhaust_arr))]
-    for ep in exhaust_positions:
-        dists = np.linalg.norm(centers[engine_indices] - ep, axis=1)
-        nearest = engine_indices[np.argsort(dists)[:n_source_per_exhaust]]
-        source_faces.update(nearest.tolist())
-
-    print(f"  热源面片: {len(source_faces)} (每尾焰 {n_source_per_exhaust})")
 
     # ── 2. 热平衡求解 T_s ──
     print(f"\n[compute] 求解热源面片 T_s...")
@@ -225,9 +228,17 @@ def main():
     # ── 4. Gauss-Seidel 扩散 ──
     print(f"\n[compute] Gauss-Seidel 扩散 (tol={diffusion_tol}, max_iter={max_iterations})...")
 
-    # 算术平均权重: 所有边 G=1
-    G = np.ones(total_edges, dtype=np.float64)
-    w = build_weights(G, new_offsets)
+    # 权重模式选择
+    if use_distance_weighted:
+        # 边长度权重: G_ij = typical_len / d_ij（解决网格密度不均匀问题）
+        G, typical_len = build_distance_weighted_G(new_offsets, new_indices, new_edge_lens)
+        w = build_weights(G, new_offsets)
+        print(f"  权重模式: 边长度权重 (typical_len={typical_len:.4f} m)")
+    else:
+        # 算术平均权重: 所有边 G=1（旧方法）
+        G = np.ones(total_edges, dtype=np.float64)
+        w = build_weights(G, new_offsets)
+        print(f"  权重模式: 算术平均权重")
 
     t_diff = time.time()
     T, iterations, max_change = run_diffusion(

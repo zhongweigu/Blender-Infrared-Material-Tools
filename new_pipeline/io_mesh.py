@@ -74,6 +74,7 @@ def export_unified_mesh(output_path, merged_obj, exhaust_positions, engine_mask)
         HEAT_SOURCE_TOL=np.float32(config.HEAT_SOURCE_TOL),
         DIFFUSION_TOL=np.float32(config.DIFFUSION_TOL),
         MAX_ITERATIONS=np.int32(config.MAX_ITERATIONS),
+        DIFFUSION_DECAY=np.float32(config.DIFFUSION_DECAY),
         Q_I=np.float32(config.Q_I),
         MACH_NUMBER=np.float32(config.MACH_NUMBER),
         LAMBDA_1=np.float32(config.LAMBDA_1),
@@ -84,6 +85,7 @@ def export_unified_mesh(output_path, merged_obj, exhaust_positions, engine_mask)
                       if config.DETECTOR_LOS is not None
                       else np.zeros(3, dtype=np.float32)),
         has_los=np.int32(0 if config.DETECTOR_LOS is None else 1),
+        env_radiation_enabled=np.int32(config.ENV_RADIATION_ENABLED),
         # Environment radiation
         I0=np.float32(config.SUN_CONSTANT),
         P=np.float32(config.ATM_TRANSPARENCY),
@@ -94,6 +96,10 @@ def export_unified_mesh(output_path, merged_obj, exhaust_positions, engine_mask)
         T_air=np.float32(config.AIR_TEMPERATURE),
         f_fi=np.float32(config.EARTH_ANGLE_COEFF),
         alpha_1=np.float32(config.ALPHA_1),
+        # Energy degradation
+        TAU0=np.float32(config.TAU0),
+        K_E=np.float32(config.K_E),
+        BETA_RATIO=np.float32(config.BETA_RATIO),
     )
     print(f"[io_mesh] 已导出统一网格: {output_path} ({n} 面)")
 
@@ -115,6 +121,10 @@ def import_results(results_path):
         'L': data['L'].astype(np.float64),
         'iterations': int(data['iterations']),
         'max_change': float(data['max_change']),
+        # 中间过程数据
+        'T_diffusion': data['T_diffusion'].astype(np.float64),
+        'T_aero': data['T_aero'].astype(np.float64),
+        'L_radiance': data['L_radiance'].astype(np.float64),
     }
     data.close()
     print(f"[io_mesh] 已读回结果: {results_path}")

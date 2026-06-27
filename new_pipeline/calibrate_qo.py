@@ -113,7 +113,7 @@ def _find_exhaust_position_merged(engines):
     return np.mean(rear, axis=0).astype(np.float32)
 
 
-def export_merged_mesh(output_path, aircraft, engine_l, engine_r):
+def export_merged_mesh(output_path, aircraft, all_engines):
     """合并所有对象为一个 mesh, 导出数据到 .npz 供外部校准脚本使用.
 
     输出 keys:
@@ -127,12 +127,10 @@ def export_merged_mesh(output_path, aircraft, engine_l, engine_r):
 
     # 记录各对象面片数 (合并前)
     ac_n = len(aircraft.data.polygons)
-    el_n = len(engine_l.data.polygons) if engine_l else 0
-    er_n = len(engine_r.data.polygons) if engine_r else 0
+    eng_face_counts = [len(eng.data.polygons) for eng in all_engines]
 
     # 尾焰核心位置 (合并前记录)
-    engines = [e for e in (engine_l, engine_r) if e is not None]
-    exhaust_pos = _find_exhaust_position_merged(engines)
+    exhaust_pos = _find_exhaust_position_merged(all_engines)
     print(f"[校准导出] 尾焰核心: ({exhaust_pos[0]:.3f}, {exhaust_pos[1]:.3f}, {exhaust_pos[2]:.3f})")
 
     # 复制并合并
@@ -147,29 +145,28 @@ def export_merged_mesh(output_path, aircraft, engine_l, engine_r):
         return dup
 
     ac_dup = _copy_obj(aircraft)
-    el_dup = _copy_obj(engine_l) if engine_l else None
-    er_dup = _copy_obj(engine_r) if engine_r else None
+    eng_copies = [_copy_obj(eng) for eng in all_engines]
 
     # 合并: aircraft 为 active, 其他 selected
     bpy.ops.object.select_all(action='DESELECT')
     ac_dup.select_set(True)
     bpy.context.view_layer.objects.active = ac_dup
-    for d in (el_dup, er_dup):
-        if d:
-            d.select_set(True)
+    for d in eng_copies:
+        d.select_set(True)
     bpy.ops.object.join()
 
     merged = ac_dup
     merged.name = "Calibration_Merged"
     print(f"[校准导出] 合并完成: {len(merged.data.polygons)} 面 "
-          f"(ac={ac_n}, el={el_n}, er={er_n})")
+          f"(ac={ac_n}, eng={sum(eng_face_counts)})")
 
     # 构建 engine_mask
     engine_mask = np.zeros(len(merged.data.polygons), dtype=bool)
-    if el_n > 0:
-        engine_mask[ac_n:ac_n + el_n] = True
-    if er_n > 0:
-        engine_mask[ac_n + el_n:ac_n + el_n + er_n] = True
+    offset = ac_n
+    for fc in eng_face_counts:
+        if fc > 0:
+            engine_mask[offset:offset + fc] = True
+            offset += fc
     print(f"[校准导出] 发动机面片: {engine_mask.sum()}")
 
     # 提取面片数据
@@ -239,24 +236,24 @@ def main():
 
     # ── 查找对象 ──
     aircraft = mesh_graph.find_aircraft()
-    engine_l = mesh_graph.find_engine_left()
-    engine_r = mesh_graph.find_engine_right()
+    engines_left, engines_right = mesh_graph.find_all_engines()
+    all_engines = engines_left + engines_right
 
     if aircraft is None:
         print("[错误] 未找到蒙皮网格对象")
         return
-    if engine_l is None and engine_r is None:
+    if not all_engines:
         print("[错误] 未找到发动机对象 (用于定位尾焰核心)")
         return
 
-    print(f"对象: Aircraft='{aircraft.name}', "
-          f"Engin_L='{engine_l.name if engine_l else 'N/A'}', "
-          f"Engin_R='{engine_r.name if engine_r else 'N/A'}'")
+    print(f"对象: Aircraft='{aircraft.name}'")
+    for i, eng in enumerate(all_engines):
+        print(f"       Engine[{i}]='{eng.name}'")
 
     # ── 模型缩放 (所有操作之前) ──
     if config.MODEL_SCALE != 1.0:
         print(f"\n[校准] 应用模型缩放: ×{config.MODEL_SCALE}")
-        for obj in (aircraft, engine_l, engine_r):
+        for obj in [aircraft] + all_engines:
             if obj is None:
                 continue
             bpy.ops.object.select_all(action='DESELECT')
@@ -272,7 +269,7 @@ def main():
     input_npz = os.path.join(tmpdir, "_blir_calibrate_input.npz")
 
     print("\n[校准] 合并 mesh 并导出...")
-    export_merged_mesh(input_npz, aircraft, engine_l, engine_r)
+    export_merged_mesh(input_npz, aircraft, all_engines)
 
     # ── 查找 .venv Python ──
     python_exe = _find_venv_python()

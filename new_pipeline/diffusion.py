@@ -39,11 +39,14 @@ def _build_csr(neighbors, conductances):
     return offsets, indices, weights
 
 
-def gauss_seidel(T, neighbors, conductances, fixed_faces=None, tol=None, max_iter=None):
+def gauss_seidel(T, neighbors, conductances, fixed_faces=None, tol=None, max_iter=None,
+                 decay=0.0, T_amb=280.0):
     """Run Gauss-Seidel diffusion on a mesh graph until steady state.
 
     Gauss-Seidel update for free face i:
-        T_i_new = Σ_j (w_ij * T_j)    where w_ij = G_ij / Σ_k G_ik
+        T_i_new = (1-α)·Σ_j (w_ij · T_j) + α·T_amb
+
+    where w_ij = G_ij / Σ_k G_ik, and α = decay pulls toward ambient.
 
     Fixed faces (Dirichlet BCs) are skipped. Boundary faces with fewer neighbors
     are handled naturally (equivalent to adiabatic edge condition).
@@ -71,29 +74,36 @@ def gauss_seidel(T, neighbors, conductances, fixed_faces=None, tol=None, max_ite
         fixed_arr = np.fromiter(fixed_faces, dtype=np.int32)
         is_fixed[fixed_arr] = True
 
-    for iteration in range(1, max_iter + 1):
-        max_change = 0.0
+    one_minus_decay = 1.0 - decay
 
-        for i in range(n):
+    def _sweep(indices):
+        max_c = 0.0
+        for i in indices:
             if is_fixed[i]:
                 continue
-
             start = int(offsets[i])
             end = int(offsets[i + 1])
             if start == end:
                 continue
-
-            # Dot product: T_new = Σ w_k * T[nbr_k]
             w_slice = nbr_w[start:end]
             t_slice = T[nbr_idx[start:end]]
-            T_new = np.dot(w_slice, t_slice)
-
-            change = abs(T_new - T[i])
-            if change > max_change:
-                max_change = change
+            T_neighbor = np.dot(w_slice, t_slice)
+            T_new = one_minus_decay * T_neighbor + decay * T_amb
+            c = abs(T_new - T[i])
+            if c > max_c:
+                max_c = c
             T[i] = T_new
+        return max_c
 
-        if max_change < tol:
-            return T, iteration, max_change
+    for iteration in range(1, max_iter + 1):
+        # Alternate which sweep goes first to cancel directional bias
+        if iteration % 2 == 1:
+            c1 = _sweep(range(n))                      # forward first
+            c2 = _sweep(range(n - 1, -1, -1))           # reverse second
+        else:
+            c2 = _sweep(range(n - 1, -1, -1))           # reverse first
+            c1 = _sweep(range(n))                      # forward second
+        if max(c1, c2) < tol:
+            return T, iteration, max(c1, c2)
 
-    return T, max_iter, max_change
+    return T, max_iter, max(c1, c2)

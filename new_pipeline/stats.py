@@ -13,16 +13,15 @@ def print_part_stats(obj_name, temperatures):
 
 
 def compute_engine_temperature(engine_obj):
-    """Compute per-face temperature for an engine mesh.
+    """Compute per-face initial temperature for an engine mesh.
 
-    Currently returns uniform temperature based on config.T_ENGINE_INIT.
-    Future: may add gradient from exhaust to front.
+    All non-source faces (engine and skin) start at ambient temperature.
     """
     if engine_obj is None or engine_obj.type != 'MESH':
         return None
     mesh = engine_obj.data
     n = len(mesh.polygons)
-    return np.full(n, config.T_ENGINE_INIT)
+    return np.full(n, config.T_AIRCRAFT_INIT)
 
 
 def print_aircraft_summary(T_aircraft, source_faces, iterations, max_change, aircraft_name="Aircraft"):

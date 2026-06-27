@@ -114,15 +114,36 @@ from new_pipeline import io_mesh
 # Helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _copy_obj(obj):
-    """Duplicate a mesh object. Returns the duplicate."""
-    bpy.ops.object.select_all(action='DESELECT')
+def _select_only(obj):
+    """Select only *obj* (deselect all others via API). No operators."""
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.duplicate()
-    dup = bpy.context.active_object
-    obj.select_set(False)
+
+
+def _copy_obj(obj):
+    """Duplicate a mesh object via API (no operators)."""
+    mesh = obj.data.copy()
+    dup = bpy.data.objects.new(obj.name + "_dup", mesh)
+    dup.matrix_world = obj.matrix_world.copy()
+    bpy.context.collection.objects.link(dup)
     return dup
+
+
+def _write_vertex_attr(mesh, attr_name, vert_values):
+    """Write a per-vertex float attribute to a mesh data block."""
+    if attr_name in mesh.attributes:
+        mesh.attributes.remove(mesh.attributes[attr_name])
+    attr = mesh.attributes.new(name=attr_name, type='FLOAT', domain='POINT')
+    attr.data.foreach_set('value', vert_values.tolist())
+
+
+def _engine_name(side, idx):
+    """Canonical engine name: 'Engin_L', 'Engin_L_2', 'Engin_R', etc."""
+    if idx == 0:
+        return f"Engin_{side}"
+    return f"Engin_{side}_{idx + 1}"
 
 
 def _find_venv_python():
@@ -145,19 +166,22 @@ def _find_venv_python():
 def _run_external_compute(merged, exhaust_positions, engine_mask):
     """Export unified mesh → subprocess compute_standalone.py → import T.
 
-    Returns (T, L, iterations, max_change, engine_mask) or
-    (None, None, 0, 0, None) on failure.
+    Returns (T, L, iterations, max_change, engine_mask,
+             T_diffusion, T_aero, L_radiance) or all Nones on failure.
     """
     python_exe = _find_venv_python()
+    print(f"[DIAG] 项目根目录: {_project_root}")
+    print(f"[DIAG] USE_EXTERNAL_COMPUTE={config.USE_EXTERNAL_COMPUTE}, "
+          f".venv={'found' if python_exe else 'NOT found'}")
     if python_exe is None:
         print("[外部计算] .venv 未找到，回退到 Blender 内计算")
-        return None, None, 0, 0, None
+        return None, None, 0, 0, None, None, None, None
 
     standalone = os.path.join(_project_root, "new_pipeline",
                               "compute_standalone.py")
     if not os.path.isfile(standalone):
         print(f"[外部计算] 脚本未找到: {standalone}")
-        return None, None, 0, 0, None
+        return None, None, 0, 0, None, None, None, None
 
     tmpdir = tempfile.gettempdir()
     input_npz = os.path.join(tmpdir, "_blir_main_input.npz")
@@ -192,24 +216,28 @@ def _run_external_compute(merged, exhaust_positions, engine_mask):
             print(f"[外部计算] 进程失败 (code={result.returncode})")
             if result.stderr:
                 print(f"  stderr: {result.stderr[:500]}")
-            return None, None, 0, 0, None
+            return (None, None, 0, 0, None,
+                    None, None, None)
 
         # Step C: read results
         res = io_mesh.import_results(output_npz)
         if res is None:
-            return None, None, 0, 0, None
+            return (None, None, 0, 0, None,
+                    None, None, None)
         return (res['T'], res['L'], res['iterations'], res['max_change'],
-                engine_mask)
+                engine_mask,
+                res.get('T_diffusion'), res.get('T_aero'),
+                res.get('L_radiance'))
 
     except FileNotFoundError:
         print(f"[外部计算] Python 未找到: {python_exe}")
-        return None, None, 0, 0, None
+        return (None, None, 0, 0, None, None, None, None)
     except subprocess.TimeoutExpired:
         print("[外部计算] 进程超时 (600s)")
-        return None, None, 0, 0, None
+        return (None, None, 0, 0, None, None, None, None)
     except Exception as e:
         print(f"[外部计算] 异常: {e}")
-        return None, None, 0, 0, None
+        return (None, None, 0, 0, None, None, None, None)
     finally:
         for f in (input_npz, output_npz):
             try:
@@ -223,8 +251,12 @@ def _run_external_compute(merged, exhaust_positions, engine_mask):
 # In-Blender compute (fallback)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _run_in_blender(merged, exhaust_positions, ac_n, el_n, er_n):
-    """Compute temperature field entirely inside Blender (pure Python)."""
+def _run_in_blender(merged, exhaust_positions, engine_mask):
+    """Compute temperature field entirely inside Blender (pure Python).
+
+    Returns (T, L, iterations, max_change, engine_mask, source_faces,
+             T_diffusion, T_aero, L_radiance)
+    """
     # ── Build mesh graph ──
     print("\n[Blender] 构建面片邻接图...")
     centers, areas, _ = mesh_graph.get_mesh_data(merged)
@@ -232,13 +264,6 @@ def _run_in_blender(merged, exhaust_positions, ac_n, el_n, er_n):
 
     n_faces = len(centers)
     print(f"  面片总数: {n_faces}")
-
-    # Engine mask
-    engine_mask = np.zeros(n_faces, dtype=bool)
-    if el_n > 0:
-        engine_mask[ac_n:ac_n + el_n] = True
-    if er_n > 0:
-        engine_mask[ac_n + el_n:ac_n + el_n + er_n] = True
     print(f"  发动机面片: {engine_mask.sum()}, 蒙皮面片: {(~engine_mask).sum()}")
 
     # ── Heat source faces ──
@@ -268,42 +293,44 @@ def _run_in_blender(merged, exhaust_positions, ac_n, el_n, er_n):
     # ── Gauss-Seidel ──
     print(f"\n[Blender] Gauss-Seidel 扩散 "
           f"(tol={config.DIFFUSION_TOL} K, max_iter={config.MAX_ITERATIONS})...")
+    print(f"  (网格已通过顶点焊接自然连通，无需结构桥)")
 
-    # 添加发动机↔蒙皮结构连接桥（merge 不会创建跨对象边）
-    cross_pairs = mesh_graph.find_cross_boundary_pairs(
-        centers, engine_mask, max_pairs=3, max_distance=2.0)
-    structural_edges = set()
-    for ei, si, dist in cross_pairs:
-        neighbors[ei].append(si)
-        neighbors[si].append(ei)
-        edge_lengths[(ei, si)] = -dist  # 负值标记为结构连接
-        edge_lengths[(si, ei)] = -dist
-        structural_edges.add((ei, si))
-        structural_edges.add((si, ei))
-    print(f"  跨边界结构桥: {len(cross_pairs)} 对 "
-          f"({len(structural_edges)//2} 条边)")
+    # 确保所有面片与热源面片在同一连通分量
+    mesh_graph.ensure_connectivity(neighbors, edge_lengths, centers, source_faces)
 
     T = np.full(n_faces, config.T_AIRCRAFT_INIT, dtype=np.float64)
     for fi, T_s in T_source_dict.items():
         T[fi] = T_s
 
-    # 算术平均：所有权重相等
+    # 算术平均：所有边权重相等
     conductances = {}
     for i, nbrs in enumerate(neighbors):
         for j in nbrs:
-            if (i, j) not in conductances:
-                conductances[(i, j)] = 1.0
-                conductances[(j, i)] = 1.0
+            if (i, j) in conductances:
+                continue
+            conductances[(i, j)] = 1.0
+            conductances[(j, i)] = 1.0
 
     T, iterations, max_change = diffusion.gauss_seidel(
         T, neighbors, conductances,
         fixed_faces=source_faces,
         tol=config.DIFFUSION_TOL,
         max_iter=config.MAX_ITERATIONS,
+        decay=config.DIFFUSION_DECAY,
+        T_amb=config.T_AMB,
     )
 
     print(f"  完成: {iterations} 次迭代, 最终 max ΔT = {max_change:.6f} K")
     print(f"  扩散后 T range: [{T.min():.1f}, {T.max():.1f}] K")
+    skin_mask = ~engine_mask
+    if skin_mask.sum() > 0:
+        skin_T_bl = T[skin_mask]
+        print(f"  [DIAG] 蒙皮 T: [{skin_T_bl.min():.1f}, {skin_T_bl.max():.1f}] K "
+              f"mean={skin_T_bl.mean():.1f} K")
+    else:
+        print(f"  [DIAG] 警告: engine_mask 全部为 True ({engine_mask.sum()}/{len(T)})")
+
+    T_diffusion = T.copy()
 
     # ── Aero heating ──
     delta_T_aero = config.T_AIRCRAFT_INIT * 0.16 * config.MACH_NUMBER ** 2
@@ -311,6 +338,8 @@ def _run_in_blender(merged, exhaust_positions, ac_n, el_n, er_n):
     print(f"\n[Blender] 气动加热: M={config.MACH_NUMBER}, "
           f"ΔT = +{delta_T_aero:.2f} K")
     print(f"  T range: [{T.min():.1f}, {T.max():.1f}] K  mean={T.mean():.1f} K")
+
+    T_aero = T.copy()
 
     # ── Temperature → Self Radiance ──
     from new_pipeline.calibrate_compute import compute_radiance
@@ -320,8 +349,7 @@ def _run_in_blender(merged, exhaust_positions, ac_n, el_n, er_n):
     print(f"  L_self range: [{L_self.min():.2f}, {L_self.max():.2f}] W/(m²·sr) "
           f"mean={L_self.mean():.2f}")
 
-    # ── Environment reflection radiation ──
-    from new_pipeline.calibrate_compute import compute_environment_radiance
+    # ── Normals (needed for detector directional and optionally env) ──
     _, _, face_verts = mesh_graph.get_mesh_data(merged)
     normals = np.empty((n_faces, 3), dtype=np.float64)
     for i, fv in enumerate(face_verts):
@@ -332,50 +360,48 @@ def _run_in_blender(merged, exhaust_positions, ac_n, el_n, er_n):
             nrm /= nlen
         normals[i] = nrm
 
-    env_config = {
-        'I0': config.SUN_CONSTANT,
-        'P': config.ATM_TRANSPARENCY,
-        'h': config.SUN_ELEVATION,
-        'azimuth': config.SUN_AZIMUTH,
-        'n_day': config.DAY_NUMBER,
-        'e': config.WATER_VAPOR_PRESSURE,
-        'T_air': config.AIR_TEMPERATURE,
-        'f_fi': config.EARTH_ANGLE_COEFF,
-        'alpha_1': config.ALPHA_1,
-        'sigma': config.SIGMA,
-    }
-    print(f"\n[Blender] 环境反射辐亮度...")
-    L_refl = compute_environment_radiance(centers, normals, config.EMISSIVITY, env_config)
-    print(f"  L_refl range: [{L_refl.min():.2f}, {L_refl.max():.2f}] W/(m²·sr) "
-          f"mean={L_refl.mean():.2f}")
-
-    L = L_self + L_refl
+    # ── Environment reflection radiation ──
+    if config.ENV_RADIATION_ENABLED:
+        from new_pipeline.calibrate_compute import compute_environment_radiance
+        env_config = {
+            'I0': config.SUN_CONSTANT,
+            'P': config.ATM_TRANSPARENCY,
+            'h': config.SUN_ELEVATION,
+            'azimuth': config.SUN_AZIMUTH,
+            'n_day': config.DAY_NUMBER,
+            'e': config.WATER_VAPOR_PRESSURE,
+            'T_air': config.AIR_TEMPERATURE,
+            'f_fi': config.EARTH_ANGLE_COEFF,
+            'alpha_1': config.ALPHA_1,
+            'sigma': config.SIGMA,
+        }
+        print(f"\n[Blender] 环境反射辐亮度...")
+        L_refl = compute_environment_radiance(centers, normals, config.EMISSIVITY, env_config)
+        print(f"  L_refl range: [{L_refl.min():.2f}, {L_refl.max():.2f}] W/(m²·sr) "
+              f"mean={L_refl.mean():.2f}")
+        L = L_self + L_refl
+    else:
+        L = L_self
     print(f"  L_total range: [{L.min():.2f}, {L.max():.2f}] W/(m²·sr) "
           f"mean={L.mean():.2f}")
 
-    # ── Detector directional radiation ──
-    from new_pipeline.calibrate_compute import compute_detector_directional
-    det_pos = np.array(config.DETECTOR_POS, dtype=np.float64)
-    det_los = (np.array(config.DETECTOR_LOS, dtype=np.float64)
-               if config.DETECTOR_LOS is not None else None)
-    print(f"\n[Blender] 探测器方向辐射 (17)...")
-    L = compute_detector_directional(L, centers, normals, det_pos, det_los)
-    print(f"  L_cam range: [{L.min():.2f}, {L.max():.2f}] W/(m²·sr) "
-          f"mean={L.mean():.2f}")
+    L_radiance = L.copy()
 
-    # ── Atmospheric attenuation ──
-    from new_pipeline.calibrate_compute import apply_atmospheric_attenuation
-    detector_pos = np.array(config.DETECTOR_POS, dtype=np.float64)
-    print(f"\n[Blender] 大气衰减: μ={config.MU_ATM:.2e} m⁻¹, "
-          f"探测器=({detector_pos[0]:.0f}, {detector_pos[1]:.0f}, {detector_pos[2]:.0f})")
-    dists = np.linalg.norm(centers - detector_pos, axis=1)
-    tau_vals = np.exp(-config.MU_ATM * dists)
-    print(f"  距离范围: [{dists.min():.0f}, {dists.max():.0f}] m, "
-          f"τ range: [{tau_vals.min():.3f}, {tau_vals.max():.3f}]")
-    L = apply_atmospheric_attenuation(L, centers, detector_pos, config.MU_ATM)
-    print(f"  L_detected range: [{L.min():.2f}, {L.max():.2f}] W/(m²·sr)")
+    # ── Energy degradation (光学系统能量衰减) ──
+    tau0 = config.TAU0
+    Ke = config.K_E
+    beta_ratio = config.BETA_RATIO
+    denom = 4.0 * Ke * Ke * (1.0 - beta_ratio) ** 2
+    if denom < 1e-9:
+        denom = 1e-9
+    eta = tau0 * np.pi / denom
+    L = L * eta
+    print(f"\n[Blender] 光学能量衰减: τ₀={tau0}, K_e={Ke}, "
+          f"β'/β_p={beta_ratio}, η={eta:.4f}")
+    print(f"  L range: [{L.min():.2f}, {L.max():.2f}] W/(m²·sr)")
 
-    return T, L, iterations, max_change, engine_mask, source_faces
+    return (T, L, iterations, max_change, engine_mask, source_faces,
+            T_diffusion, T_aero, L_radiance)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -383,33 +409,42 @@ def _run_in_blender(merged, exhaust_positions, ac_n, el_n, er_n):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # ── 确保每次调用都拿到最新的模块状态 ──────────────────────────────────
+    import importlib as _il
+    for _mn in ("new_pipeline.config", "new_pipeline.mesh_graph",
+                "new_pipeline.heat_source", "new_pipeline.diffusion",
+                "new_pipeline.visualize", "new_pipeline.io_mesh",
+                "new_pipeline.calibrate_compute"):
+        if _mn in sys.modules:
+            _il.reload(sys.modules[_mn])
+
     t_start = time.time()
 
     # ── 0. 查找对象 ──────────────────────────────────────────────────────
     aircraft = mesh_graph.find_aircraft()
-    engine_l = mesh_graph.find_engine_left()
-    engine_r = mesh_graph.find_engine_right()
+    engines_left, engines_right = mesh_graph.find_all_engines()
+    all_engines = engines_left + engines_right
 
     if aircraft is None:
         print("[错误] 未找到蒙皮网格对象")
         return
 
-    ac_n = len(aircraft.data.polygons)
-    el_n = len(engine_l.data.polygons) if engine_l else 0
-    er_n = len(engine_r.data.polygons) if engine_r else 0
+    ac_n_orig = len(aircraft.data.polygons)
+    ac_n = ac_n_orig
+    eng_face_counts = [len(eng.data.polygons) for eng in all_engines]
+    total_eng_faces = sum(eng_face_counts)
 
     exhaust_positions_model = []
-    for eng in (engine_l, engine_r):
-        if eng:
-            pos = mesh_graph.find_exhaust_position(eng)
-            if pos is not None:
-                exhaust_positions_model.append(np.array(pos))
+    for eng in all_engines:
+        pos = mesh_graph.find_exhaust_position(eng)
+        if pos is not None:
+            exhaust_positions_model.append(np.array(pos))
 
     print(f"物体: Aircraft='{aircraft.name}' ({ac_n} 面)")
-    if engine_l:
-        print(f"       Engin_L='{engine_l.name}' ({el_n} 面)")
-    if engine_r:
-        print(f"       Engin_R='{engine_r.name}' ({er_n} 面)")
+    for side, eng_list in [('L', engines_left), ('R', engines_right)]:
+        for idx, eng in enumerate(eng_list):
+            i = all_engines.index(eng)
+            print(f"       {_engine_name(side, idx)}='{eng.name}' ({eng_face_counts[i]} 面)")
     for i, ep in enumerate(exhaust_positions_model):
         print(f"  尾焰核心 {i+1} (模型坐标): "
               f"({ep[0]:.3f}, {ep[1]:.3f}, {ep[2]:.3f})")
@@ -421,40 +456,61 @@ def main():
         print("[错误] Q_O 未校准，请先运行 calibrate_qo.py 并将结果填入 config.py")
         return
 
-    # ── 1. 合并所有部件 ──────────────────────────────────────────────────
-    print("\n[1] 合并所有部件为统一网格...")
+    # ── 1. 焊接机身接缝顶点（合并前，只焊机身不动发动机） ──────────────
+    print("\n[1] 准备网格...")
     ac_dup = _copy_obj(aircraft)
-    el_dup = _copy_obj(engine_l) if engine_l else None
-    er_dup = _copy_obj(engine_r) if engine_r else None
+    eng_copies = [_copy_obj(eng) for eng in all_engines]
+
+    if config.MERGE_VERTEX_DIST > 0:
+        _select_only(ac_dup)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        nv_before = len(ac_dup.data.vertices)
+        bpy.ops.mesh.remove_doubles(threshold=config.MERGE_VERTEX_DIST)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        nv_after = len(ac_dup.data.vertices)
+        ac_n = len(ac_dup.data.polygons)
+        if nv_before != nv_after:
+            print(f"  机身顶点焊接: {nv_before - nv_after} 顶点 "
+                  f"({nv_before} → {nv_after}), 面片={ac_n}")
 
     aircraft.hide_viewport = True
     aircraft.hide_render = True
-    if engine_l:
-        engine_l.hide_viewport = True
-        engine_l.hide_render = True
-    if engine_r:
-        engine_r.hide_viewport = True
-        engine_r.hide_render = True
+    for eng in all_engines:
+        eng.hide_viewport = True
+        eng.hide_render = True
 
-    bpy.ops.object.select_all(action='DESELECT')
-    ac_dup.select_set(True)
-    bpy.context.view_layer.objects.active = ac_dup
-    for d in (el_dup, er_dup):
-        if d:
-            d.select_set(True)
+    # ── 2. 合并所有部件 ──────────────────────────────────────────────────
+    _select_only(ac_dup)
+    for ec in eng_copies:
+        ec.select_set(True)
     bpy.ops.object.join()
 
     merged = ac_dup
     merged.name = "IR_Unified_Mesh"
     print(f"  合并完成: {len(merged.data.polygons)} 面 "
-          f"(ac={ac_n}, el={el_n}, er={er_n})")
+          f"(ac={ac_n}, eng={total_eng_faces})")
 
-    # ── 2. 缩放到真实尺寸 ───────────────────────────────────────────────
+    # 焊接发动机-机身交界处顶点，使 mesh graph 自然连通
+    nf_before = len(merged.data.polygons)
+    nv_before = len(merged.data.vertices)
+    _select_only(merged)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.remove_doubles(threshold=config.MERGE_VERTEX_DIST)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    nv_after = len(merged.data.vertices)
+    nf_after = len(merged.data.polygons)
+    if nv_before != nv_after:
+        print(f"  交界面焊接: {nv_before - nv_after} 顶点 "
+              f"({nv_before} → {nv_after})")
+    if nf_before != nf_after:
+        print(f"  {nf_before - nf_after} 个退化面片被移除")
+
+    # ── 3. 缩放到真实尺寸 ───────────────────────────────────────────────
     if config.MODEL_SCALE != 1.0:
         print(f"\n[2] 缩放到真实尺寸: ×{config.MODEL_SCALE}")
-        bpy.ops.object.select_all(action='DESELECT')
-        merged.select_set(True)
-        bpy.context.view_layer.objects.active = merged
+        _select_only(merged)
         merged.scale *= config.MODEL_SCALE
         bpy.ops.object.transform_apply(scale=True)
         print("  缩放完成 (合并后统一缩放，相对位置正确)")
@@ -465,41 +521,112 @@ def main():
         print(f"  尾焰核心 {i+1} (真实坐标): "
               f"({ep[0]:.3f}, {ep[1]:.3f}, {ep[2]:.3f})")
 
-    # Build engine_mask (needed by both paths and for stats/render)
-    n_faces = len(merged.data.polygons)
-    engine_mask = np.zeros(n_faces, dtype=bool)
-    if el_n > 0:
-        engine_mask[ac_n:ac_n + el_n] = True
-    if er_n > 0:
-        engine_mask[ac_n + el_n:ac_n + el_n + er_n] = True
+    # ── 对称化网格 ──────────────────────────────────────────────────────
+    if config.SYMMETRIZE_MESH:
+        print(f"\n[对称化] 沿X=0强制对称化网格...")
+        mesh_graph.symmetrize_mesh(merged)
 
-    # ── 3. Compute (external or in-Blender) ─────────────────────────────
+    # Build engine_mask (engine faces are at the end of the merged face list)
+    n_faces = len(merged.data.polygons)
+    total_eng = sum(eng_face_counts)
+    ac_n = n_faces - total_eng  # recalculate after possible face removal
+    engine_mask = np.zeros(n_faces, dtype=bool)
+    if total_eng > 0:
+        engine_mask[ac_n:] = True
+    print(f"  engine_mask: {engine_mask.sum()} engine / {(~engine_mask).sum()} body (总计 {n_faces})")
+
+    # ── 3.5. Uniform减面 ──────────────────────────────────────────────
+    compute_mesh = merged
+    compute_engine_mask = engine_mask
+    decimated = None
+    is_decimated = False
+
+    if config.DECIMATE_RATIO < 1.0:
+        print(f"\n[3.5] Uniform减面 ratio={config.DECIMATE_RATIO}...")
+        orig_centers, _, _ = mesh_graph.get_mesh_data(merged)
+        orig_eng_idx = np.where(engine_mask)[0]
+
+        decimated = _copy_obj(merged)
+        decimated.name = merged.name + "_decimated"
+        is_decimated = True
+
+        _select_only(decimated)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.decimate(ratio=config.DECIMATE_RATIO)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        dec_centers, _, _ = mesh_graph.get_mesh_data(decimated)
+        print(f"  减面后: {len(dec_centers)} 面 (原 {n_faces} 面)")
+
+        compute_engine_mask = np.zeros(len(dec_centers), dtype=bool)
+        if len(orig_eng_idx) > 0:
+            if mesh_graph.cKDTree is not None:
+                tree = mesh_graph.cKDTree(dec_centers)
+                _, nearest = tree.query(orig_centers[orig_eng_idx])
+                compute_engine_mask[np.unique(nearest)] = True
+            else:
+                for ei in orig_eng_idx:
+                    d = np.sum((dec_centers - orig_centers[ei]) ** 2, axis=1)
+                    compute_engine_mask[np.argmin(d)] = True
+        print(f"  发动机面片映射: {compute_engine_mask.sum()}")
+
+        compute_mesh = decimated
+
+    # ── 4. Compute (external or in-Blender) ─────────────────────────────
     source_faces = set()
     L = None
+    T_diffusion = T_aero = L_radiance = None
 
     if config.USE_EXTERNAL_COMPUTE:
-        T, L, iterations, max_change, _ = _run_external_compute(
-            merged, exhaust_positions, engine_mask)
+        (T, L, iterations, max_change, _,
+         T_diffusion, T_aero, L_radiance) = _run_external_compute(
+            compute_mesh, exhaust_positions, compute_engine_mask)
         if T is not None:
             print("\n[外部计算] 成功")
-            # Recompute source_faces for stats (same logic as external)
-            n_eng = int(engine_mask.sum())
+            n_eng = int(compute_engine_mask.sum())
             n_src = max(5, min(200, int(n_eng * 0.05)))
-            eng_idx = np.where(engine_mask)[0]
-            centers, _, _ = mesh_graph.get_mesh_data(merged)
+            eng_idx = np.where(compute_engine_mask)[0]
+            cc, _, _ = mesh_graph.get_mesh_data(compute_mesh)
             for ep in exhaust_positions:
-                dists = np.linalg.norm(centers[eng_idx] - ep, axis=1)
+                dists = np.linalg.norm(cc[eng_idx] - ep, axis=1)
                 nearest = eng_idx[np.argsort(dists)[:n_src]]
                 source_faces.update(nearest.tolist())
         else:
             print("\n[外部计算] 失败，回退到 Blender 内计算")
-            T, L, iterations, max_change, engine_mask, source_faces = \
-                _run_in_blender(merged, exhaust_positions, ac_n, el_n, er_n)
+            (T, L, iterations, max_change, _, source_faces,
+             T_diffusion, T_aero, L_radiance) = \
+                _run_in_blender(compute_mesh, exhaust_positions, compute_engine_mask)
     else:
-        T, L, iterations, max_change, engine_mask, source_faces = \
-            _run_in_blender(merged, exhaust_positions, ac_n, el_n, er_n)
+        (T, L, iterations, max_change, _, source_faces,
+         T_diffusion, T_aero, L_radiance) = \
+            _run_in_blender(compute_mesh, exhaust_positions, compute_engine_mask)
 
-    # ── 4. 统计输出 ────────────────────────────────────────────────────
+    # ── Upsample back to original mesh ─────────────────────────────────
+    if is_decimated:
+        print(f"\n[upsample] 温度映射回原始网格 ({len(T)} → {n_faces} 面)...")
+        merged_centers, _, _ = mesh_graph.get_mesh_data(merged)
+
+        def _upsample_fb(src_c, src_t, dst_c):
+            n_dst = len(dst_c)
+            out = np.empty(n_dst, dtype=np.float64)
+            for b0 in range(0, n_dst, 1000):
+                b1 = min(b0 + 1000, n_dst)
+                d2 = np.sum((dst_c[b0:b1, None, :] - src_c[None, :, :]) ** 2, axis=2)
+                out[b0:b1] = np.asarray(src_t, dtype=np.float64)[np.argmin(d2, axis=1)]
+            return out
+
+        T = _upsample_fb(dec_centers, T, merged_centers)
+        L = _upsample_fb(dec_centers, L, merged_centers)
+        if T_diffusion is not None:
+            T_diffusion = _upsample_fb(dec_centers, T_diffusion, merged_centers)
+        if T_aero is not None:
+            T_aero = _upsample_fb(dec_centers, T_aero, merged_centers)
+        if L_radiance is not None:
+            L_radiance = _upsample_fb(dec_centers, L_radiance, merged_centers)
+        mesh_graph.cleanup_decimated(decimated, is_decimated)
+
+    # ── 5. 统计输出 ────────────────────────────────────────────────────
     delta_T_aero = config.T_AIRCRAFT_INIT * 0.16 * config.MACH_NUMBER ** 2
     print(f"\n{'='*60}")
     print(f"  稳态温度计算结果")
@@ -518,6 +645,8 @@ def main():
     if skin_mask.sum() > 0:
         skin_T = T[skin_mask]
         print(f"  {'蒙皮':12s} | {skin_T.min():10.2f}  {skin_T.max():10.2f}  {skin_T.mean():10.2f} K")
+        if skin_T.max() - skin_T.min() < 0.01:
+            print(f"  [DIAG] 警告: 蒙皮温度无扩散 (max-min={skin_T.max()-skin_T.min():.4f} K)")
     if engine_mask.sum() > 0:
         eng_T = T[engine_mask]
         print(f"  {'发动机':12s} | {eng_T.min():10.2f}  {eng_T.max():10.2f}  {eng_T.mean():10.2f} K")
@@ -526,17 +655,66 @@ def main():
         source_T = np.array([T[fi] for fi in source_faces])
         print(f"  {'热源面片':12s} | {source_T.min():10.2f}  {source_T.max():10.2f}  {source_T.mean():10.2f} K")
 
+    # 左右发动机分别统计
+    n_left_eng = len(engines_left)
+    n_right_eng = len(engines_right)
+    if n_left_eng > 0 and n_right_eng > 0 and L is not None:
+        off = ac_n
+        left_mask = np.zeros(n_faces, dtype=bool)
+        for fc in eng_face_counts[:n_left_eng]:
+            left_mask[off:off + fc] = True
+            off += fc
+        right_mask = np.zeros(n_faces, dtype=bool)
+        for fc in eng_face_counts[n_left_eng:]:
+            right_mask[off:off + fc] = True
+            off += fc
+        if left_mask.sum() > 0 and right_mask.sum() > 0:
+            print(f"  {'左发 L':12s} | {L[left_mask].min():10.2f}  {L[left_mask].max():10.2f}  {L[left_mask].mean():10.2f} W/(m²·sr)")
+            print(f"  {'右发 L':12s} | {L[right_mask].min():10.2f}  {L[right_mask].max():10.2f}  {L[right_mask].mean():10.2f} W/(m²·sr)")
+            print(f"  {'左发 T':12s} | {T[left_mask].min():10.2f}  {T[left_mask].max():10.2f}  {T[left_mask].mean():10.2f} K")
+            print(f"  {'右发 T':12s} | {T[right_mask].min():10.2f}  {T[right_mask].max():10.2f}  {T[right_mask].mean():10.2f} K")
     print(f"\n{'='*60}")
     t_compute = time.time()
     print(f"计算耗时: {t_compute - t_start:.1f} s")
 
-    # ── 5. 材质 + 渲染 (基于辐亮度 L) ────────────────────────────────────
+    # ── 5.5 过程图片输出 ─────────────────────────────────────────────────
+    if config.PROCESS_IMAGES_ENABLED:
+        print(f"\n[过程图片] 输出管线各阶段结果...")
+        img_dir = bpy.path.abspath(config.PROCESS_IMAGES_DIR)
+        os.makedirs(img_dir, exist_ok=True)
+        # 正面偏左下方向上看飞机
+        cam_loc = (-35, -70, -8)
+        target = (0, 0, 4)
+
+        def _render_step(face_vals, filename, label, color_mode="thermal"):
+            print(f"  {label} → {filename}")
+            visualize.clear_scene_materials()
+            vmi = float(face_vals.min())
+            vma = float(face_vals.max())
+            if vma <= vmi:
+                vma = vmi + 1.0
+            visualize.assign_value_material(
+                merged, merged.data, face_vals,
+                attr_name="Radiance",
+                color_mode=color_mode,
+                vmin=vmi, vmax=vma,
+                mat_name="IR_Process",
+            )
+            visualize.setup_camera(cam_loc, target=target)
+            visualize.render_to_file(os.path.join(img_dir, filename))
+
+        # 温度阶段用热成像彩色，辐射阶段用黑白
+        _render_step(T_diffusion, "01_temperature_diffusion.png", "扩散后温度", "thermal")
+        _render_step(T_aero, "02_temperature_aero.png", "气动加热后温度", "thermal")
+        _render_step(L_radiance, "03_radiance.png", "Planck辐亮度", "bw")
+        _render_step(L, "04_radiance_final.png", "最终辐亮度(能量衰减后)", "bw")
+
+    # ── 6. 材质 + 渲染 ────────────────────────────────────────────────
     vmin = float(L.min())
-    vmax = float(L.max())
+    vmax = float(np.percentile(L, config.RENDER_VMAX_PERCENTILE))
     if vmax <= vmin:
         vmax = vmin + 1.0
 
-    # 始终给合并网格上材质（GUI 下可看到结果）
     print(f"\n[可视化] 辐亮度范围: {vmin:.2f} ~ {vmax:.2f} W/(m²·sr)")
     visualize.clear_scene_materials()
     visualize.assign_value_material(
@@ -544,7 +722,7 @@ def main():
         attr_name="Radiance",
         color_mode=config.RENDER_COLOR_MODE,
         vmin=vmin, vmax=vmax,
-        mat_name="IR_Radiance"
+        mat_name="IR_Radiance",
     )
 
     if config.RENDER_ENABLED:
@@ -559,20 +737,82 @@ def main():
         )
 
     # ── 清理 ────────────────────────────────────────────────────────────
-    if bpy.app.background:
-        # 后台模式：删除合并网格，恢复原始对象
-        bpy.data.objects.remove(merged, do_unlink=True)
-        aircraft.hide_viewport = False
-        aircraft.hide_render = False
-        if engine_l:
-            engine_l.hide_viewport = False
-            engine_l.hide_render = False
-        if engine_r:
-            engine_r.hide_viewport = False
-            engine_r.hide_render = False
-    else:
-        # GUI 模式：保留合并网格供查看；原始对象保持隐藏
-        print("[可视化] GUI 模式 — 合并网格已保留在场景中，原始对象已隐藏")
+    merged_centers, _, _ = mesh_graph.get_mesh_data(merged)
+
+    merged_mesh = merged.data
+    bpy.data.objects.remove(merged, do_unlink=True)
+    if merged_mesh.users == 0:
+        bpy.data.meshes.remove(merged_mesh)
+
+    for mat in list(bpy.data.materials):
+        if mat.users == 0:
+            bpy.data.materials.remove(mat)
+
+    # 将 IR 材质应用到原始机身（面片布局: [aircraft | eng_0 | eng_1 | ...]）
+    aircraft_L = L[:ac_n]
+    if ac_n != ac_n_orig:
+        ac_orig_centers, _, _ = mesh_graph.get_mesh_data(aircraft)
+        aircraft_L = mesh_graph.upsample_temperatures_fallback(
+            merged_centers[:ac_n], aircraft_L, ac_orig_centers)
+    visualize.assign_value_material(
+        aircraft, aircraft.data, aircraft_L,
+        attr_name="Radiance",
+        color_mode=config.RENDER_COLOR_MODE,
+        vmin=vmin, vmax=vmax,
+        mat_name="IR_Radiance",
+    )
+    ir_mat = bpy.data.materials.get("IR_Radiance")
+
+    # 发动机
+    slice_start = ac_n
+    for eng, fc in zip(all_engines, eng_face_counts):
+        if fc == 0:
+            continue
+        eng_L = L[slice_start:slice_start + fc]
+        vert = visualize.face_to_vertex(eng.data, eng_L)
+        _write_vertex_attr(eng.data, "Radiance", vert)
+        if not eng.data.materials:
+            eng.data.materials.append(ir_mat)
+        slice_start += fc
+
+    # 重命名
+    renames = []
+    if aircraft.name != "Aircraft":
+        renames.append((aircraft, "Aircraft"))
+    for side, eng_list in [('L', engines_left), ('R', engines_right)]:
+        for idx, eng in enumerate(eng_list):
+            target_name = _engine_name(side, idx)
+            if eng.name != target_name:
+                renames.append((eng, target_name))
+
+    for i, (obj, _target) in enumerate(renames):
+        obj.name = f"_tmp_rename_{i}"
+    for obj, target in renames:
+        if target in bpy.data.objects:
+            bpy.data.objects.remove(bpy.data.objects[target], do_unlink=True)
+        old_name = obj.name
+        obj.name = target
+        print(f"  重命名: {old_name} → {target}")
+
+    # 恢复可见性
+    aircraft.hide_viewport = False
+    aircraft.hide_render = False
+    for eng in all_engines:
+        eng.hide_viewport = False
+        eng.hide_render = False
+
+    # ── 保存处理后的 .blend ──
+    _batch_output = os.environ.get('BLIR_OUTPUT_PATH', '')
+    if _batch_output:
+        os.makedirs(os.path.dirname(_batch_output), exist_ok=True)
+        bpy.ops.wm.save_as_mainfile(filepath=_batch_output)
+        print(f"已保存: {_batch_output}")
+    elif config.SAVE_PROCESSED_BLEND and bpy.data.filepath:
+        dir_path = os.path.dirname(bpy.path.abspath("//"))
+        base_name = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0]
+        save_path = os.path.join(dir_path, f"{base_name}{config.PROCESSED_BLEND_SUFFIX}.blend")
+        bpy.ops.wm.save_as_mainfile(filepath=save_path)
+        print(f"已保存: {save_path}")
 
     print("完成")
 

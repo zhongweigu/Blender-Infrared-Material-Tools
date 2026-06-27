@@ -3,7 +3,15 @@
     "allow": [
       "Bash(python *)",
       "Bash(\"D:/codes/MTIR-Blender-InfraRed-Material-Tools/.venv/Scripts/pip.exe\" install *)",
-      "Bash(D:/codes/MTIR-Blender-InfraRed-Material-Tools/.venv/Scripts/python.exe *)"
+      "Bash(D:/codes/MTIR-Blender-InfraRed-Material-Tools/.venv/Scripts/python.exe *)",
+      "Bash(sed -i '557s/\\(0.0, 1.0, 0.0, 1.0\\)/\\(0.2, 1.0, 0.2, 1.0\\)/' new_pipeline/main.py)",
+      "Bash(sed -i '558s/1.0/1.5/' new_pipeline/main.py)",
+      "Bash(sed -i '563s/0.0008/0.002/' new_pipeline/main.py)",
+      "Bash(/d/environments/py3.8/python -c \"import py_compile; py_compile.compile\\('new_pipeline/main.py', doraise=True\\); print\\('Syntax OK'\\)\")",
+      "Bash(/d/environments/py3.8/python -c ' *)",
+      "Bash(/d/environments/py3.8/python -c \"import py_compile; py_compile.compile\\('new_pipeline/config.py', doraise=True\\); py_compile.compile\\('new_pipeline/stats.py', doraise=True\\); py_compile.compile\\('new_pipeline/main.py', doraise=True\\); py_compile.compile\\('new_pipeline/compute_standalone.py', doraise=True\\); py_compile.compile\\('new_pipeline/calibrate_compute.py', doraise=True\\); print\\('All Syntax OK'\\)\")",
+      "Bash(/d/environments/py3.8/python -c \"import py_compile; py_compile.compile\\('new_pipeline/config.py', doraise=True\\); py_compile.compile\\('new_pipeline/main.py', doraise=True\\); py_compile.compile\\('new_pipeline/compute_standalone.py', doraise=True\\); py_compile.compile\\('new_pipeline/calibrate_compute.py', doraise=True\\); py_compile.compile\\('new_pipeline/stats.py', doraise=True\\); print\\('Syntax OK'\\)\")",
+      "Bash(blender -b \"aircraft/aircraft_1.blend\" --python \"./new_pipeline/main.py\")"
     ]
   }
 }

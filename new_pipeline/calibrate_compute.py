@@ -36,10 +36,14 @@ def _point_dist(a, b):
 
 
 @njit
-def _gauss_seidel_sweep(T, offsets, nbr_idx, weights, is_fixed):
-    """单次 Gauss-Seidel 扫描, 返回 max|ΔT|."""
+def _gauss_seidel_sweep(T, offsets, nbr_idx, weights, is_fixed, decay, T_amb):
+    """单次 Gauss-Seidel 扫描, 返回 max|ΔT|.
+
+    T[i]_new = (1-decay) * Σ(w_k * T[nbr_k]) + decay * T_amb
+    """
     n = len(T)
     max_change = 0.0
+    one_minus_decay = 1.0 - decay
     for i in range(n):
         if is_fixed[i]:
             continue
@@ -50,6 +54,36 @@ def _gauss_seidel_sweep(T, offsets, nbr_idx, weights, is_fixed):
         s = 0.0
         for k in range(start, end):
             s += weights[k] * T[nbr_idx[k]]
+        s = one_minus_decay * s + decay * T_amb
+        change = s - T[i]
+        if change < 0.0:
+            change = -change
+        if change > max_change:
+            max_change = change
+        T[i] = s
+    return max_change
+
+
+@njit
+def _gauss_seidel_sweep_reverse(T, offsets, nbr_idx, weights, is_fixed, decay, T_amb):
+    """单次 Gauss-Seidel 反向扫描 (n-1 → 0), 返回 max|ΔT|.
+
+    与前向扫描配合使用以消除扫描方向偏差。
+    """
+    n = len(T)
+    max_change = 0.0
+    one_minus_decay = 1.0 - decay
+    for i in range(n - 1, -1, -1):
+        if is_fixed[i]:
+            continue
+        start = offsets[i]
+        end = offsets[i + 1]
+        if start == end:
+            continue
+        s = 0.0
+        for k in range(start, end):
+            s += weights[k] * T[nbr_idx[k]]
+        s = one_minus_decay * s + decay * T_amb
         change = s - T[i]
         if change < 0.0:
             change = -change
@@ -103,43 +137,31 @@ def build_weights(G_flat, offsets):
 _C1 = 3.7418e-16   # 2πhc²  W·m²
 _C2 = 1.4388e-2    # hc/k    m·K
 
-@njit
-def _phi(x, T, eps_over_pi):
-    """(7) 式被积原函数 Φ(x,T) 的被 njit 内联版本. 单点计算."""
-    if T <= 0.0:
-        return 0.0
-    a = _C2 / T           # C₂/T
-    inv_a = 1.0 / a       # T/C₂
-    exp_term = np.exp(-a / x)
-    # x³ + 3 / [a · (x² + 2 / [a · (x + 1/a)])]
-    inner = x + inv_a
-    inner = x * x + 2.0 / (a * inner)
-    inner = x * x * x + 3.0 / (a * inner)
-    return eps_over_pi * _C1 * inv_a * exp_term * inner
-
-
 def compute_radiance(T, emissivity, lambda_1, lambda_2):
-    """每面片波段积分辐亮度 L_self (原文 (6)/(7) 式).
-
-    Args:
-        T: (N,) 温度数组 (K)
-        emissivity: 表面发射率 ε
-        lambda_1: 波段下限 (m)
-        lambda_2: 波段上限 (m)
-
-    Returns:
-        L: (N,) 辐亮度数组 W/(m²·sr)
-    """
-    T = np.asarray(T, dtype=np.float64)
+    """每面片波段积分辐亮度 L_self (原文 (6)/(7) 式)."""
+    n = len(T)
     eps_over_pi = emissivity / np.pi
     x1 = 1.0 / lambda_1
     x2 = 1.0 / lambda_2
 
-    L = np.empty_like(T)
-    for i in range(len(T)):
-        phi1 = _phi(x1, T[i], eps_over_pi)
-        phi2 = _phi(x2, T[i], eps_over_pi)
-        L[i] = phi1 - phi2
+    L = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        Ti = T[i]
+        if Ti <= 0.0:
+            L[i] = 0.0
+            continue
+        a = _C2 / Ti
+        inv_a = 1.0 / a
+        # φ(x) = exp(-a/x) * [x³ + 3/(a·(x² + 2/(a·(x + 1/a))))]
+        e1 = np.exp(-a / x1)
+        inner1 = x1 + inv_a
+        inner1 = x1 * x1 + 2.0 / (a * inner1)
+        phi1 = e1 * (x1 * x1 * x1 + 3.0 / (a * inner1))
+        e2 = np.exp(-a / x2)
+        inner2 = x2 + inv_a
+        inner2 = x2 * x2 + 2.0 / (a * inner2)
+        phi2 = e2 * (x2 * x2 * x2 + 3.0 / (a * inner2))
+        L[i] = eps_over_pi * _C1 * inv_a * (phi1 - phi2)
     return L
 
 
@@ -314,6 +336,74 @@ def compute_detector_directional(L_total, centers, normals,
     return L_total * cos_theta_c * cos_theta_s
 
 
+def ensure_connectivity(neighbors, edge_lengths, centers, source_faces):
+    """Connect faces in components that have no heat source to the nearest
+    face in a source-containing component.
+
+    Faces in a connected component without any heat source will never receive
+    heat during diffusion — they stay at their initial temperature forever.
+    This function finds those faces and bridges them to the source component.
+
+    Args:
+        neighbors: list of lists (mutated in place)
+        edge_lengths: dict (mutated in place)
+        centers: (N, 3) face centers
+        source_faces: set of face indices that are heat sources
+
+    Returns:
+        n_bridged: number of faces that were bridged
+    """
+    n = len(neighbors)
+    if n == 0:
+        return 0
+
+    # BFS from source faces to find all reachable faces
+    reachable = np.zeros(n, dtype=bool)
+    queue = list(source_faces)
+    for s in queue:
+        reachable[s] = True
+    head = 0
+    while head < len(queue):
+        fi = queue[head]
+        head += 1
+        for nj in neighbors[fi]:
+            if not reachable[nj]:
+                reachable[nj] = True
+                queue.append(nj)
+
+    n_reachable = int(reachable.sum())
+    if n_reachable == n:
+        return 0  # all faces connected
+
+    # Unreachable faces → bridge each to nearest reachable face
+    reachable_idx = np.where(reachable)[0]
+    unreachable_idx = np.where(~reachable)[0]
+    reachable_centers = centers[reachable_idx]
+
+    # Typical edge length for weight normalization
+    pos_lens = [abs(v) for v in edge_lengths.values() if v > 0]
+    typical_len = float(np.median(pos_lens)) if pos_lens else 1.0
+
+    bridged = 0
+    for ui in unreachable_idx:
+        ci = centers[ui]
+        dists = np.sum((reachable_centers - ci) ** 2, axis=1)
+        j = reachable_idx[int(np.argmin(dists))]
+        proxy_len = float(np.sqrt(dists.min()))
+
+        neighbors[ui].append(j)
+        neighbors[j].append(ui)
+        # Negative value = connectivity bridge, magnitude = distance.
+        # Weight will be scaled by typical_len / distance.
+        edge_lengths[(ui, j)] = -proxy_len
+        edge_lengths[(j, ui)] = -proxy_len
+        bridged += 1
+
+    print(f"[mesh_graph] 连通性修复: {bridged} 个面片桥接到热源分量 "
+          f"(总面片={n}, 可达={n_reachable}, 不可达={n - n_reachable})")
+    return bridged
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 热平衡方程求解
 # ══════════════════════════════════════════════════════════════════════════════
@@ -385,7 +475,7 @@ def solve_all_source_faces(source_indices, centers, exhaust_pos, areas,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_diffusion(T_init, offsets, nbr_idx, weights, fixed_set,
-                  tol, max_iter):
+                  tol, max_iter, decay=0.0, T_amb=280.0):
     """Gauss-Seidel 扩散, 返回 (T, iterations, max_change)."""
     T = T_init.copy().astype(np.float64)
     n = len(T)
@@ -394,7 +484,7 @@ def run_diffusion(T_init, offsets, nbr_idx, weights, fixed_set,
         is_fixed[f] = 1
 
     for iteration in range(1, max_iter + 1):
-        max_change = _gauss_seidel_sweep(T, offsets, nbr_idx, weights, is_fixed)
+        max_change = _gauss_seidel_sweep(T, offsets, nbr_idx, weights, is_fixed, decay, T_amb)
         if max_change < tol:
             return T, iteration, max_change
     return T, max_iter, max_change
@@ -423,6 +513,7 @@ def compute_with_qo(data, q_o, k_skin, skin_thickness,
     sigma = float(data['SIGMA'])
     hs_tol = float(data['HEAT_SOURCE_TOL'])
     q_i = float(data['Q_I'])
+    decay = float(data.get('DIFFUSION_DECAY', 0.0))
 
     # 1. 诊断: 打印距离分布
     print(f"\n[calibrate] 尾焰核心: ({exhaust_pos[0]:.4f}, {exhaust_pos[1]:.4f}, {exhaust_pos[2]:.4f})")
@@ -470,7 +561,8 @@ def compute_with_qo(data, q_o, k_skin, skin_thickness,
 
     T, iters, change = run_diffusion(
         T, offsets, indices, w, set(source_faces),
-        tol=diffusion_tol, max_iter=max_iterations
+        tol=diffusion_tol, max_iter=max_iterations,
+        decay=decay, T_amb=T_amb,
     )
 
     # 发动机区域统计

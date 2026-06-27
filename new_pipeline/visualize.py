@@ -9,6 +9,7 @@ import os
 import bpy
 import math
 import numpy as np
+from new_pipeline import config
 
 
 # ============================================================
@@ -44,19 +45,9 @@ def assign_value_material(obj, mesh, per_face_values, attr_name="Value",
     """Create a shader material that colors the mesh by per-face scalar values.
 
     Node chain: VertexAttribute(attr_name) → MapRange(vmin,vmax→0,1) →
-               ColorRamp → Emission → Output
+               Gamma(Power) → ColorRamp → Emission → Output
 
-    Args:
-        obj: Blender mesh object
-        mesh: mesh data block
-        per_face_values: (N_faces,) array of scalar values
-        attr_name: name for the vertex attribute
-        color_mode: 'thermal' (blue-cyan-yellow-red) or 'bw' (black-white)
-        vmin, vmax: normalization range (auto-compute if None)
-        mat_name: Blender material name
-
-    Returns:
-        The created material.
+    Gamma exponent and emission strength are read from config.py.
     """
     # Normalize range
     arr = np.asarray(per_face_values)
@@ -85,32 +76,39 @@ def assign_value_material(obj, mesh, per_face_values, attr_name="Value",
 
     # --- Nodes ---
     output = nodes.new("ShaderNodeOutputMaterial")
-    output.location = (600, 0)
+    output.location = (800, 0)
 
     emission = nodes.new("ShaderNodeEmission")
-    emission.location = (400, 0)
-    emission.inputs["Strength"].default_value = 1.0
+    emission.location = (600, 0)
+    emission.inputs["Strength"].default_value = float(config.RENDER_EMISSION_STRENGTH)
 
     attr_node = nodes.new("ShaderNodeAttribute")
-    attr_node.location = (-200, 0)
+    attr_node.location = (-400, 0)
     attr_node.attribute_name = attr_name
 
     map_range = nodes.new("ShaderNodeMapRange")
-    map_range.location = (0, 0)
+    map_range.location = (-200, 0)
     map_range.inputs['From Min'].default_value = vmin
     map_range.inputs['From Max'].default_value = vmax
     map_range.inputs['To Min'].default_value = 0.0
     map_range.inputs['To Max'].default_value = 1.0
 
+    # ── Gamma boost: Power node with exponent < 1 brightens midtones ──
+    gamma_node = nodes.new("ShaderNodeMath")
+    gamma_node.location = (100, 0)
+    gamma_node.operation = 'POWER'
+    gamma_node.inputs[1].default_value = float(config.RENDER_GAMMA)
+
     color_ramp = nodes.new("ShaderNodeValToRGB")
-    color_ramp.location = (200, 0)
+    color_ramp.location = (400, 0)
     color_ramp.color_ramp.interpolation = 'LINEAR'
 
     _setup_color_ramp(color_ramp, color_mode)
 
     # --- Links ---
     links.new(attr_node.outputs["Fac"], map_range.inputs["Value"])
-    links.new(map_range.outputs["Result"], color_ramp.inputs["Fac"])
+    links.new(map_range.outputs["Result"], gamma_node.inputs[0])
+    links.new(gamma_node.outputs["Value"], color_ramp.inputs["Fac"])
     links.new(color_ramp.outputs["Color"], emission.inputs["Color"])
     links.new(emission.outputs["Emission"], output.inputs["Surface"])
 
@@ -145,8 +143,13 @@ def _setup_color_ramp(color_ramp, mode):
             el.color = color
 
     elif mode == "bw":
+        t = float(config.RENDER_BW_THRESHOLD)
+        g = float(config.RENDER_BW_BASE_GRAY)
         els[0].position = 0.0
-        els[0].color = (0.0, 0.0, 0.0, 1.0)
+        els[0].color = (g, g, g, 1.0)
+        # threshold stop: below this value everything stays flat gray
+        el_mid = els.new(t)
+        el_mid.color = (g + 0.02, g + 0.02, g + 0.02, 1.0)
         els[1].position = 1.0
         els[1].color = (1.0, 1.0, 1.0, 1.0)
 
@@ -242,7 +245,7 @@ def render_multiview(obj, mesh, face_values, output_dir, base_name="radiance",
         attr_name=attr_name,
         color_mode=color_mode,
         vmin=vmin, vmax=vmax,
-        mat_name="IR_Radiance"
+        mat_name="IR_Radiance",
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -294,7 +297,7 @@ def render_temperature(obj, mesh, face_values, output_path,
         attr_name=attr_name,
         color_mode=color_mode,
         vmin=vmin, vmax=vmax,
-        mat_name="IR_Radiance"
+        mat_name="IR_Radiance",
     )
     print(f"  数值范围: {vmin or face_values.min():.2f} ~ {vmax or face_values.max():.2f}")
 
@@ -303,5 +306,25 @@ def render_temperature(obj, mesh, face_values, output_path,
     if target is None:
         target = (0, 0, 3)
 
+    # White background
+    scene = bpy.context.scene
+    world = scene.world
+    bg_restore = None
+    if world and world.use_nodes:
+        bg_node = world.node_tree.nodes.get('Background')
+        if bg_node:
+            bg_restore = (
+                bg_node.inputs['Color'].default_value[:],
+                bg_node.inputs['Strength'].default_value,
+            )
+            bg_node.inputs['Color'].default_value = (1, 1, 1, 1)
+            bg_node.inputs['Strength'].default_value = 1.0
+
     setup_camera(cam_location, target=target)
     render_to_file(output_path)
+
+    if bg_restore:
+        bg_node = world.node_tree.nodes.get('Background')
+        if bg_node:
+            bg_node.inputs['Color'].default_value = bg_restore[0]
+            bg_node.inputs['Strength'].default_value = bg_restore[1]

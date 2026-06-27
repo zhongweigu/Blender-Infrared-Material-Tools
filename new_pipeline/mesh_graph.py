@@ -69,7 +69,40 @@ def build_face_adjacency(obj):
             edge_lengths[(i, j)] = edge_len
             edge_lengths[(j, i)] = edge_len
 
+    # ── Distance-based fallback for orphan faces ──
+    # Faces with 0 edge-neighbors (steep/narrow faces at mesh seams) get
+    # connected to their nearest face by center distance.
+    orphan_indices = [i for i in range(n_faces) if len(neighbors[i]) == 0]
+    if orphan_indices:
+        # Compute all face centers in world space
+        centers = np.empty((n_faces, 3), dtype=np.float64)
+        for i, poly in enumerate(mesh.polygons):
+            c = poly.center
+            wc = matrix @ c
+            centers[i] = (wc.x, wc.y, wc.z)
+
+        for i in orphan_indices:
+            ci = centers[i]
+            # Find nearest non-orphan face (prefer well-connected faces)
+            dists = np.sum((centers - ci) ** 2, axis=1)
+            dists[i] = np.inf  # exclude self
+            # Exclude other orphans to avoid orphan clusters
+            for oi in orphan_indices:
+                dists[oi] = np.inf
+            j = int(np.argmin(dists))
+            if np.isfinite(dists[j]):
+                neighbors[i].append(j)
+                neighbors[j].append(i)
+                # Use center distance as proxy edge length
+                proxy_len = float(np.sqrt(dists[j]))
+                edge_lengths[(i, j)] = proxy_len
+                edge_lengths[(j, i)] = proxy_len
+        print(f"[mesh_graph] 距离回退: {len(orphan_indices)} 个孤立面片已连接到最近邻")
+
     return neighbors, edge_lengths
+
+
+from new_pipeline.calibrate_compute import ensure_connectivity  # noqa: E402
 
 
 def compute_conductances(centers, neighbors, edge_lengths, k=None, thickness=None):
@@ -141,9 +174,16 @@ def find_object(candidates):
 
 
 def find_aircraft():
-    """Find the aircraft mesh object with flexible name matching."""
-    candidates = ["Aircraft", "aircraft", "AirCraft", "body", "Body",
-                  "fuselage", "Fuselage", "plane", "Plane", "AIRFRAME"]
+    """Find the aircraft mesh object with flexible name matching.
+
+    Matches any object whose name contains 'air' (Airliner, Aircraft, etc.),
+    falling back to common fuselage/body/model names.
+    """
+    candidates = ["Aircraft", "aircraft", "Airliner", "airliner",
+                  "body", "Body", "fuselage", "Fuselage",
+                  "plane", "Plane", "AIRFRAME",
+                  "model_normalized", "Model_Normalized", "Model",
+                  "air"]  # wildcard: matches anything with "air" in name
     return find_object(candidates)
 
 
@@ -151,7 +191,8 @@ def find_engine_left():
     """Find the left engine mesh object with flexible name matching."""
     candidates = ["Engin_L", "engin_l", "Engine_L", "engine_l",
                   "EngineL", "enginL", "Eng_L", "eng_l",
-                  "engine_left", "Engine_Left", "ENGINE_L"]
+                  "engine_left", "Engine_Left", "ENGINE_L",
+                  "model_normalized.001", "Model_Normalized.001"]
     return find_object(candidates)
 
 
@@ -159,8 +200,61 @@ def find_engine_right():
     """Find the right engine mesh object with flexible name matching."""
     candidates = ["Engin_R", "engin_r", "Engine_R", "engine_r",
                   "EngineR", "enginR", "Eng_R", "eng_r",
-                  "engine_right", "Engine_Right", "ENGINE_R"]
+                  "engine_right", "Engine_Right", "ENGINE_R",
+                  "model_normalized.002", "Model_Normalized.002"]
     return find_object(candidates)
+
+
+def _centroid_x(obj):
+    """World-space X centroid of a mesh object."""
+    verts = obj.data.vertices
+    mw = obj.matrix_world
+    return sum((mw @ v.co).x for v in verts) / len(verts)
+
+
+def find_all_engines():
+    """Find all engine mesh objects, classified by X centroid.
+
+    Engines are identified by name patterns (engin, engine, motor, jet)
+    and assigned left/right based on their world-space X centroid.
+    Falls back to vertex-count heuristic if no engine-named objects exist.
+
+    Returns:
+        (left_engines, right_engines): tuple of lists, each sorted by |X|
+    """
+    aircraft = find_aircraft()
+
+    engine_patterns = ["engin", "engine", "eng_", "eng ", "motor", "jet", "eng"]
+
+    candidates = []
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        if aircraft and obj == aircraft:
+            continue
+        name_lower = obj.name.lower()
+        if any(pat in name_lower for pat in engine_patterns):
+            candidates.append(obj)
+
+    if not candidates:
+        meshes = sorted(
+            [(obj, len(obj.data.vertices)) for obj in bpy.data.objects if obj.type == 'MESH'],
+            key=lambda x: x[1], reverse=True,
+        )
+        candidates = [obj for obj, _ in meshes[1:]]
+
+    left, right = [], []
+    for obj in candidates:
+        x = _centroid_x(obj)
+        if x < 0:
+            left.append((x, obj))
+        else:
+            right.append((x, obj))
+
+    left.sort(key=lambda p: p[0])
+    right.sort(key=lambda p: p[0])
+
+    return [obj for _, obj in left], [obj for _, obj in right]
 
 
 def find_exhaust_position(engine_obj):
@@ -408,8 +502,8 @@ def lookup_engine_face_temp(skin_centers, skin_face_idx, engine_obj, engine_temp
     return float(eng_T[np.argmin(dists)])
 
 
-def find_cross_boundary_pairs(centers, engine_mask, max_pairs=3,
-                               max_distance=2.0):
+def find_cross_boundary_pairs(centers, engine_mask, max_pairs=5,
+                               max_distance=10.0):
     """Find nearest (engine, aircraft) face pairs for structural thermal bridges.
 
     After joining meshes, engine and aircraft faces share no edges. This
@@ -455,3 +549,54 @@ def find_cross_boundary_pairs(centers, engine_mask, max_pairs=3,
                     pairs.append((int(ei), int(ac_idx[ni]), d))
 
     return pairs
+
+
+def symmetrize_mesh(obj):
+    """Symmetrize mesh vertices across X=0 by mirror-averaging.
+
+    For each vertex, finds its nearest neighbor in the X-reflected
+    vertex set, then averages both positions to enforce strict
+    geometric symmetry about the X=0 plane.
+
+    The mesh topology (faces, edges) is unchanged — only vertex
+    positions are modified.
+    """
+    from mathutils import Vector
+    mesh = obj.data
+    mw = obj.matrix_world
+    n_verts = len(mesh.vertices)
+
+    verts_world = np.array([mw @ v.co for v in mesh.vertices], dtype=np.float64)
+
+    # Reflected point cloud (X flipped)
+    reflected = verts_world.copy()
+    reflected[:, 0] = -reflected[:, 0]
+
+    # Nearest-neighbor: each vertex → its closest mirror counterpart
+    if cKDTree is not None:
+        tree = cKDTree(reflected)
+        _, nn = tree.query(verts_world)
+    else:
+        nn = np.zeros(n_verts, dtype=np.int64)
+        for i in range(n_verts):
+            nn[i] = np.argmin(np.sum((reflected - verts_world[i]) ** 2, axis=1))
+
+    # Partner world position: reflect the reflected point back
+    partner = reflected[nn].copy()
+    partner[:, 0] = -partner[:, 0]
+
+    # Average original with mirror partner
+    new_world = (verts_world + partner) * 0.5
+
+    # Write back in local space
+    mw_inv = mw.inverted()
+    for i, v in enumerate(mesh.vertices):
+        v.co = mw_inv @ Vector(new_world[i])
+
+    # Measure residual asymmetry
+    verts_after = np.array([mw @ v.co for v in mesh.vertices], dtype=np.float64)
+    asym = np.abs(verts_after[:, 0]).mean()
+    old_asym = np.abs(verts_world[:, 0]).mean()
+    print(f"[mesh_graph] 对称化: X质心 {verts_world[:, 0].mean():.4f} → "
+          f"{verts_after[:, 0].mean():.6f}, "
+          f"平均|X| {old_asym:.4f} → {asym:.4f} m")

@@ -1,22 +1,22 @@
-"""Standalone unified-mesh steady-state temperature computation.
+"""
+外部计算脚本: 统一网格稳态温度计算
 
-Usage: python compute_standalone.py input.npz output.npz
+用法: python compute_standalone.py input.npz output.npz
 
-No Blender dependency. Uses numba JIT for Gauss-Seidel acceleration.
-Imports core numerics from calibrate_compute.py (same heat-balance formula).
+无 Blender 依赖。使用 numba JIT 加速 Gauss-Seidel。
 
-Algorithm (matches _run_in_blender in main.py exactly):
-  1. Load unified mesh CSR + config from input.npz
-  2. Auto-select heat source faces (nearest 5% engine faces per exhaust)
-  3. Solve T_s via bisection using calibrated Q_O
-  4. Build neighbor graph + ensure_connectivity (mesh welded at export)
-  5. Gauss-Seidel diffusion (arithmetic mean, with decay toward T_amb)
-  6. Aerodynamic heating
-  7. T → L_self (Planck spectral radiance)
-  8. L_refl (environment reflection) — only if env_radiation_enabled
-  9. L_total = L_self [+ L_refl]
-  10. Energy degradation (optical system attenuation)
-  11. Save T, L, T_diffusion, T_aero, L_radiance + stats to output.npz
+算法 (pipeline.md §§3-9 + §13.1):
+  1. 加载网格 CSR + 配置参数
+  2. 【关键】添加跨边界结构连接 (add_cross_boundary_bridges)
+  3. 热源面片识别 (最近 5% 发动机面片)
+  4. 热平衡求解 T_s (二分法)
+  5. Gauss-Seidel 扩散 (算术平均权重)
+  6. 气动加热 ΔT = T_amb × 0.16 × M²
+  7. 温度→辐亮度 (Planck 经验近似公式7)
+  8. 能量衰减 η = τ₀π / [4K_e²(1-β'/β_p)²]
+  9. 保存结果
+
+不计算: 环境辐射(§10), 大气衰减(§11), 探测器方向因子(§12)
 """
 
 import sys
@@ -24,30 +24,59 @@ import os
 import time
 import numpy as np
 
-# ── path ──
+# ── 项目路径 ──
 _proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _proj_root not in sys.path:
     sys.path.insert(0, _proj_root)
 
 from new_pipeline.calibrate_compute import (
-    compute_G_flat,
     build_weights,
     _gauss_seidel_sweep,
     _gauss_seidel_sweep_reverse,
     solve_heat_balance,
     compute_radiance,
-    compute_environment_radiance,
-    ensure_connectivity,
+    add_cross_boundary_bridges,
 )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Gauss-Seidel driver (wrapper around jitted sweep)
+# CSR → 邻接表重建
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rebuild_adjacency(offsets, indices, edge_lens):
+    """
+    从 CSR 结构重建 list of lists 邻接表 + edge_lengths dict。
+
+    Returns:
+        neighbors: list of lists
+        edge_lengths: dict {(i, j): length}
+    """
+    n = len(offsets) - 1
+    neighbors = []
+    edge_lengths = {}
+
+    for i in range(n):
+        start, end = int(offsets[i]), int(offsets[i + 1])
+        nbrs = []
+        for k in range(start, end):
+            j = int(indices[k])
+            nbrs.append(j)
+            if (i, j) not in edge_lengths:
+                el = float(edge_lens[k])
+                edge_lengths[(i, j)] = el
+                edge_lengths[(j, i)] = el
+        neighbors.append(nbrs)
+
+    return neighbors, edge_lengths
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Gauss-Seidel driver
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_diffusion(T_init, offsets, nbr_idx, weights, fixed_set,
                   tol, max_iter, decay=0.0, T_amb=280.0):
-    """Gauss-Seidel diffusion. Returns (T, iterations, max_change)."""
+    """Gauss-Seidel 扩散。返回 (T, iterations, max_change)。"""
     n = len(T_init)
     T = T_init.copy().astype(np.float64)
     is_fixed = np.zeros(n, dtype=np.int32)
@@ -55,6 +84,7 @@ def run_diffusion(T_init, offsets, nbr_idx, weights, fixed_set,
         is_fixed[f] = 1
 
     for iteration in range(1, max_iter + 1):
+        # 正向 + 反向扫描消除方向偏差
         if iteration % 2 == 1:
             c1 = _gauss_seidel_sweep(T, offsets, nbr_idx, weights, is_fixed, decay, T_amb)
             c2 = _gauss_seidel_sweep_reverse(T, offsets, nbr_idx, weights, is_fixed, decay, T_amb)
@@ -68,7 +98,7 @@ def run_diffusion(T_init, offsets, nbr_idx, weights, fixed_set,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Main
+# 主入口
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -83,7 +113,7 @@ def main():
     print(f"[compute] 加载: {input_path}")
     data = np.load(input_path)
 
-    # ── Read mesh data ──
+    # ── 读取网格数据 ──
     centers = data['centers'].astype(np.float64)
     areas = data['areas'].astype(np.float64)
     offsets = data['offsets']
@@ -93,18 +123,16 @@ def main():
     engine_mask = data['engine_mask']
 
     n_faces = len(centers)
-    print(f"[compute] 面片总数: {n_faces}, 发动机: {engine_mask.sum()}")
+    print(f"[compute] 面片总数: {n_faces}, 发动机: {int(engine_mask.sum())}")
 
-    # ── Read config ──
+    # ── 读取配置参数 ──
     T_exhaust = float(data['T_EXHAUST'])
     q_o = float(data['Q_O'])
     T_aircraft_init = float(data['T_AIRCRAFT_INIT'])
     T_amb = float(data['T_AMB'])
     emissivity = float(data['EMISSIVITY'])
-    k_skin = float(data['K_SKIN'])
     k_struct = float(data['K_STRUCTURE'])
     a_struct = float(data['A_STRUCTURE'])
-    skin_thickness = float(data['SKIN_THICKNESS'])
     sigma = float(data['SIGMA'])
     hs_tol = float(data['HEAT_SOURCE_TOL'])
     diffusion_tol = float(data['DIFFUSION_TOL'])
@@ -112,8 +140,43 @@ def main():
     diffusion_decay = float(data.get('DIFFUSION_DECAY', 0.0))
     q_i = float(data['Q_I'])
     mach = float(data['MACH_NUMBER'])
+    lambda_1 = float(data['LAMBDA_1'])
+    lambda_2 = float(data['LAMBDA_2'])
+    tau0 = float(data.get('TAU0', 0.85))
+    K_e = float(data.get('K_E', 2.0))
+    beta_ratio = float(data.get('BETA_RATIO', 0.0))
+    cross_max_pairs = int(data.get('CROSS_BOUNDARY_MAX_PAIRS', 5))
+    cross_max_dist = float(data.get('CROSS_BOUNDARY_MAX_DISTANCE', 5.0))
 
-    # ── 1. Heat source faces ───────────────────────────────────────────
+    # ── 重建邻接表 ──
+    neighbors, edge_lengths = rebuild_adjacency(offsets, indices, edge_lens)
+
+    # ── 【关键】跨边界结构连接 ──
+    print(f"\n[compute] 跨边界桥接 (max_pairs={cross_max_pairs}, max_dist={cross_max_dist:.1f} m)...")
+    n_bridges = add_cross_boundary_bridges(
+        neighbors, edge_lengths, centers, engine_mask,
+        max_pairs=cross_max_pairs, max_distance=cross_max_dist
+    )
+    print(f"  跨边界桥接: {n_bridges} 条边")
+
+    # ── 重新构建 CSR (含桥接边) ──
+    n = len(neighbors)
+    new_offsets = np.zeros(n + 1, dtype=np.int32)
+    counts = [len(nbrs) for nbrs in neighbors]
+    new_offsets[1:] = np.cumsum(counts)
+    total_edges = new_offsets[-1]
+
+    new_indices = np.empty(total_edges, dtype=np.int32)
+    new_edge_lens = np.empty(total_edges, dtype=np.float64)
+
+    for i in range(n):
+        start = new_offsets[i]
+        nbrs = neighbors[i]
+        for k, j in enumerate(nbrs):
+            new_indices[start + k] = j
+            new_edge_lens[start + k] = edge_lengths.get((i, j), 1.0)
+
+    # ── 1. 热源面片识别 ──
     print(f"\n[compute] 识别热源面片 (T_o={T_exhaust} K, Q_O={q_o:.4f} W)...")
 
     n_engine = int(engine_mask.sum())
@@ -132,10 +195,9 @@ def main():
         nearest = engine_indices[np.argsort(dists)[:n_source_per_exhaust]]
         source_faces.update(nearest.tolist())
 
-    print(f"  热源面片: {len(source_faces)} "
-          f"(每尾焰 {n_source_per_exhaust}, 发动机共 {n_engine} 面)")
+    print(f"  热源面片: {len(source_faces)} (每尾焰 {n_source_per_exhaust})")
 
-    # ── 2. Solve T_s for each heat source face ─────────────────────────
+    # ── 2. 热平衡求解 T_s ──
     print(f"\n[compute] 求解热源面片 T_s...")
     T_source_dict = {}
     for fi in source_faces:
@@ -152,56 +214,18 @@ def main():
         T_source_dict[fi] = T_s
 
     T_s_vals = np.array(list(T_source_dict.values()))
-    print(f"  T_s: [{T_s_vals.min():.0f}, {T_s_vals.max():.0f}] K "
-          f"mean={T_s_vals.mean():.0f} K")
+    print(f"  T_s: [{T_s_vals.min():.0f}, {T_s_vals.max():.0f}] K mean={T_s_vals.mean():.0f} K")
 
-    # ── 3. Initialize temperature field ────────────────────────────────
+    # ── 3. 初始化温度场 ──
     print(f"\n[compute] 初始化温度场 (蒙皮初始={T_aircraft_init} K)...")
     T = np.full(n_faces, T_aircraft_init, dtype=np.float64)
     for fi, T_s in T_source_dict.items():
         T[fi] = T_s
 
-    # ── 4. Build neighbor graph (网格已通过顶点焊接自然连通) ──────────
-    n = len(centers)
-    nbr_list = []
-    elen_dict = {}
-    for i in range(n):
-        start, end = int(offsets[i]), int(offsets[i + 1])
-        nbrs = list(int(indices[k]) for k in range(start, end))
-        nbr_list.append(nbrs)
-        for k, j in enumerate(nbrs):
-            if (i, j) not in elen_dict:
-                elen_dict[(i, j)] = float(edge_lens[start + k])
-                elen_dict[(j, i)] = float(edge_lens[start + k])
+    # ── 4. Gauss-Seidel 扩散 ──
+    print(f"\n[compute] Gauss-Seidel 扩散 (tol={diffusion_tol}, max_iter={max_iterations})...")
 
-    # 确保所有面片与热源面片在同一连通分量
-    bridged = ensure_connectivity(
-        nbr_list, elen_dict, centers, source_faces)
-
-    if bridged > 0:
-        new_counts = [len(nbrs) for nbrs in nbr_list]
-        new_offsets = np.zeros(n + 1, dtype=np.int32)
-        np.cumsum(new_counts, out=new_offsets[1:])
-        new_total = int(new_offsets[-1])
-        new_indices = np.zeros(new_total, dtype=np.int32)
-        new_edge_lens = np.zeros(new_total, dtype=np.float64)
-        pos = [0] * n
-        for i in range(n):
-            for j in nbr_list[i]:
-                p = new_offsets[i] + pos[i]
-                new_indices[p] = j
-                new_edge_lens[p] = elen_dict.get((i, j), 0.0)
-                pos[i] += 1
-    else:
-        new_offsets = offsets
-        new_indices = indices
-        new_edge_lens = edge_lens
-
-    # ── 5. Gauss-Seidel diffusion ──────────────────────────────────────
-    print(f"[compute] Gauss-Seidel 扩散 "
-          f"(tol={diffusion_tol}, max_iter={max_iterations}, decay={diffusion_decay})...")
-
-    total_edges = int(new_offsets[-1])
+    # 算术平均权重: 所有边 G=1
     G = np.ones(total_edges, dtype=np.float64)
     w = build_weights(G, new_offsets)
 
@@ -211,83 +235,50 @@ def main():
         tol=diffusion_tol, max_iter=max_iterations,
         decay=diffusion_decay, T_amb=T_amb,
     )
-    print(f"  完成: {iterations} 次迭代, {time.time() - t_diff:.1f} s, "
-          f"max ΔT = {max_change:.6f} K")
+    print(f"  完成: {iterations} 次迭代, {time.time() - t_diff:.1f} s, max ΔT={max_change:.6f} K")
     print(f"  扩散后 T range: [{T.min():.1f}, {T.max():.1f}] K")
-    skin_mask = ~engine_mask
-    if skin_mask.sum() > 0:
-        skin_T_diag = T[skin_mask]
-        print(f"  [DIAG] 蒙皮 T: [{skin_T_diag.min():.1f}, {skin_T_diag.max():.1f}] K "
-              f"mean={skin_T_diag.mean():.1f} K")
-    else:
-        print(f"  [DIAG] 警告: engine_mask 全部为 True ({engine_mask.sum()}/{len(T)})")
 
-    T_diffusion = T.copy()
-
-    # ── 6. Aerodynamic heating ─────────────────────────────────────────
-    delta_aero = T_aircraft_init * 0.16 * mach * mach
-    T += delta_aero
-    print(f"\n[compute] 气动加热: M={mach}, ΔT = +{delta_aero:.2f} K")
-    print(f"  T range: [{T.min():.1f}, {T.max():.1f}] K  mean={T.mean():.1f} K")
-
-    T_aero = T.copy()
-
-    # ── 7. Temperature → Self Radiance ─────────────────────────────────
-    lambda_1 = float(data['LAMBDA_1'])
-    lambda_2 = float(data['LAMBDA_2'])
-    print(f"\n[compute] 温度→自身辐亮度 (波段 {lambda_1*1e6:.0f}-{lambda_2*1e6:.0f} μm)...")
-    L_self = compute_radiance(T, emissivity, lambda_1, lambda_2)
-    print(f"  L_self range: [{L_self.min():.2f}, {L_self.max():.2f}] W/(m²·sr)  mean={L_self.mean():.2f}")
-
-    # ── 8. Environment reflection radiation ─────────────────────────────
-    normals = data['normals'].astype(np.float64)
-    env_enabled = bool(data.get('env_radiation_enabled', 0))
-    if env_enabled:
-        print(f"\n[compute] 环境反射辐亮度...")
-        env_config = {
-            'I0': float(data['I0']),
-            'P': float(data['P']),
-            'h': float(data['h']),
-            'azimuth': float(data['azimuth']),
-            'n_day': int(data['n_day']),
-            'e': float(data['e']),
-            'T_air': float(data['T_air']),
-            'f_fi': float(data['f_fi']),
-            'alpha_1': float(data['alpha_1']),
-            'sigma': float(data['SIGMA']),
-        }
-        L_refl = compute_environment_radiance(centers, normals, emissivity, env_config)
-        print(f"  L_refl range: [{L_refl.min():.2f}, {L_refl.max():.2f}] W/(m²·sr)  mean={L_refl.mean():.2f}")
-        L = L_self + L_refl
-    else:
-        L = L_self
-    print(f"  L_total range: [{L.min():.2f}, {L.max():.2f}] W/(m²·sr)  mean={L.mean():.2f}")
-
-    L_radiance = L.copy()
-
-    # ── 9. Energy degradation (光学系统能量衰减) ────────────────────────
-    tau0 = float(data.get('TAU0', 0.85))
-    Ke = float(data.get('K_E', 2.0))
-    beta_ratio = float(data.get('BETA_RATIO', 0.0))
-    denom = 4.0 * Ke * Ke * (1.0 - beta_ratio) ** 2
-    if denom < 1e-9:
-        denom = 1e-9
-    eta = tau0 * np.pi / denom
-    L = L * eta
-    print(f"\n[compute] 光学能量衰减: τ₀={tau0}, K_e={Ke}, β'/β_p={beta_ratio}")
-    print(f"  衰减因子 η={eta:.4f}, L range: [{L.min():.2f}, {L.max():.2f}] W/(m²·sr)")
-
-    # ── 10. Per-region stats ───────────────────────────────────────────
     skin_mask = ~engine_mask
     if skin_mask.sum() > 0:
         skin_T = T[skin_mask]
-        print(f"  蒙皮: [{skin_T.min():.0f}, {skin_T.max():.0f}] K  mean={skin_T.mean():.0f} K")
+        print(f"  蒙皮 T: [{skin_T.min():.1f}, {skin_T.max():.1f}] K mean={skin_T.mean():.1f} K")
+
+    T_diffusion = T.copy()
+
+    # ── 5. 氨动加热 ──
+    delta_aero = T_aircraft_init * 0.16 * mach * mach
+    T += delta_aero
+    print(f"\n[compute] 气动加热: M={mach}, ΔT={delta_aero:.2f} K")
+    print(f"  T range: [{T.min():.1f}, {T.max():.1f}] K mean={T.mean():.1f} K")
+
+    T_aero = T.copy()
+
+    # ── 6. 温度→辐亮度 (Planck 公式7) ──
+    print(f"\n[compute] 温度→辐亮度 (波段 {lambda_1*1e6:.0f}-{lambda_2*1e6:.0f} μm)...")
+    L_self = compute_radiance(T, emissivity, lambda_1, lambda_2)
+    print(f"  L_self: [{L_self.min():.2f}, {L_self.max():.2f}] W/(m²·sr) mean={L_self.mean():.2f}")
+
+    L_radiance = L_self.copy()
+
+    # ── 7. 能量衰减 (公式4) ──
+    denom = 4.0 * K_e * K_e * (1.0 - beta_ratio) ** 2
+    if denom < 1e-9:
+        denom = 1e-9
+    eta = tau0 * np.pi / denom
+    L = L_self * eta
+    print(f"\n[compute] 能量衰减: τ₀={tau0}, K_e={K_e}, η={eta:.4f}")
+    print(f"  L_out: [{L.min():.2f}, {L.max():.2f}] W/(m²·sr)")
+
+    # ── 8. 统计 ──
+    if skin_mask.sum() > 0:
+        skin_T = T[skin_mask]
+        print(f"  蒙皮: [{skin_T.min():.0f}, {skin_T.max():.0f}] K mean={skin_T.mean():.0f} K")
     if engine_mask.sum() > 0:
         eng_T = T[engine_mask]
-        print(f"  发动机: [{eng_T.min():.0f}, {eng_T.max():.0f}] K  mean={eng_T.mean():.0f} K")
+        print(f"  发动机: [{eng_T.min():.0f}, {eng_T.max():.0f}] K mean={eng_T.mean():.0f} K")
 
-    # ── 11. Save results ───────────────────────────────────────────────
-    print(f"\n[compute] 保存结果: {output_path}")
+    # ── 9. 保存结果 ──
+    print(f"\n[compute] 保存: {output_path}")
     np.savez_compressed(output_path,
         T=T.astype(np.float64),
         L=L.astype(np.float64),

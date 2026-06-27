@@ -72,24 +72,44 @@ def find_models():
 
 
 def adapt_object_names():
-    """Rename mesh objects so the pipeline can find them."""
+    """Rename mesh objects so the pipeline can find them.
+
+    Matching rules:
+      - 机身: "model_normalized" (精确匹配，不含后缀) 或包含 "air"
+      - 发动机: 包含 "engin" 或 "model_normalized.001/.002/..." (后缀变体)
+
+    Output names: Aircraft, Engin_L, Engin_R
+    """
     from new_pipeline.mesh_graph import find_object
 
     renamed = {}
 
-    body_candidates = ["Aircraft", "aircraft", "Airliner", "airliner",
-                       "AirCraft", "body", "Body", "fuselage", "Fuselage",
-                       "plane", "Plane", "AIRFRAME",
-                       "model_normalized", "Model_Normalized", "Model",
-                       "air"]
-    body = find_object(body_candidates)
+    # 1. 精确匹配 model_normalized (机身专用)
+    body = None
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH':
+            if obj.name.lower() == "model_normalized":
+                body = obj
+                break
 
-    engine_patterns = ["engin", "engine", "eng_", "eng ", "motor", "jet",
-                       "eng",
-                       "model_normalized.001", "model_normalized.002",
-                       "model_normalized.003", "model_normalized.004",
-                       "Model_Normalized.001", "Model_Normalized.002"]
+    # 2. 如果没找到，用 substring 匹配 air 或其他机身关键词
+    if body is None:
+        body_candidates = ["air", "body", "fuselage", "plane", "airframe", "model"]
+        for obj in bpy.data.objects:
+            if obj.type != 'MESH':
+                continue
+            name_lower = obj.name.lower()
+            # 排除发动机后缀变体
+            if name_lower.startswith("model_normalized.") or name_lower.startswith("model_normalized_"):
+                continue
+            for name in body_candidates:
+                if name.lower() in name_lower:
+                    body = obj
+                    break
+            if body is not None:
+                break
 
+    # 发动机匹配: 包含 "engin" 或 model_normalized 后缀变体
     eng_candidates = []
     for obj in bpy.data.objects:
         if obj.type != 'MESH':
@@ -97,7 +117,14 @@ def adapt_object_names():
         if body and obj == body:
             continue
         name_lower = obj.name.lower()
-        if any(pat.lower() in name_lower for pat in engine_patterns):
+
+        # 包含 "engin"
+        if "engin" in name_lower:
+            eng_candidates.append(obj)
+            continue
+
+        # model_normalized 后缀变体 (.001, .002, ...)
+        if name_lower.startswith("model_normalized.") or name_lower.startswith("model_normalized_"):
             eng_candidates.append(obj)
 
     if not eng_candidates:

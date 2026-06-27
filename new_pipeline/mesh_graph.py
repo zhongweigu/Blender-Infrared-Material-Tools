@@ -176,15 +176,32 @@ def find_object(candidates):
 def find_aircraft():
     """Find the aircraft mesh object with flexible name matching.
 
-    Matches any object whose name contains 'air' (Airliner, Aircraft, etc.),
-    falling back to common fuselage/body/model names.
+    Priority:
+      1. Exact match "model_normalized" (机身专用，不含.001/.002后缀)
+      2. Contains "air" (case-insensitive) → Airliner, Aircraft, etc.
+      3. Common body names: body, fuselage, plane, AIRFRAME
     """
-    candidates = ["Aircraft", "aircraft", "Airliner", "airliner",
-                  "body", "Body", "fuselage", "Fuselage",
-                  "plane", "Plane", "AIRFRAME",
-                  "model_normalized", "Model_Normalized", "Model",
-                  "air"]  # wildcard: matches anything with "air" in name
-    return find_object(candidates)
+    # 1. 精确匹配 model_normalized (不含后缀)
+    for obj in bpy.data.objects:
+        if obj.type == 'MESH':
+            name_lower = obj.name.lower()
+            if name_lower == "model_normalized":
+                return obj
+
+    # 2. 包含 "air" 或其他机身关键词
+    candidates = ["air", "body", "fuselage", "plane", "airframe", "model"]
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        name_lower = obj.name.lower()
+        # 排除发动机后缀变体
+        if name_lower.startswith("model_normalized.") or name_lower.startswith("model_normalized_"):
+            continue
+        for name in candidates:
+            if name.lower() in name_lower:
+                return obj
+
+    return None
 
 
 def find_engine_left():
@@ -215,8 +232,10 @@ def _centroid_x(obj):
 def find_all_engines():
     """Find all engine mesh objects, classified by X centroid.
 
-    Engines are identified by name patterns (engin, engine, motor, jet)
-    and assigned left/right based on their world-space X centroid.
+    Engines are identified by:
+      1. Name contains "engin" (case-insensitive)
+      2. Name matches "model_normalized.001", ".002", ".003"... (ShapeNet后缀)
+    Assigned left/right based on world-space X centroid.
     Falls back to vertex-count heuristic if no engine-named objects exist.
 
     Returns:
@@ -224,7 +243,7 @@ def find_all_engines():
     """
     aircraft = find_aircraft()
 
-    engine_patterns = ["engin", "engine", "eng_", "eng ", "motor", "jet", "eng"]
+    engine_patterns = ["engin"]
 
     candidates = []
     for obj in bpy.data.objects:
@@ -233,7 +252,14 @@ def find_all_engines():
         if aircraft and obj == aircraft:
             continue
         name_lower = obj.name.lower()
+
+        # 1. 包含 "engin" 关键词
         if any(pat in name_lower for pat in engine_patterns):
+            candidates.append(obj)
+            continue
+
+        # 2. model_normalized 后缀变体 (.001, .002, .003...)
+        if name_lower.startswith("model_normalized.") or name_lower.startswith("model_normalized_"):
             candidates.append(obj)
 
     if not candidates:

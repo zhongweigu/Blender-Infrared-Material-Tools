@@ -404,6 +404,86 @@ def ensure_connectivity(neighbors, edge_lengths, centers, source_faces):
     return bridged
 
 
+def add_cross_boundary_bridges(neighbors, edge_lengths, centers, engine_mask,
+                                max_pairs=5, max_distance=5.0):
+    """Add synthetic edges between engine and body faces for heat transfer.
+
+    When the engine and body meshes are separate shells (no shared edges after
+    merge), heat cannot diffuse across the boundary. This function adds multiple
+    nearest-neighbor bridges in both directions (engine→body and body→engine),
+    creating a dense connection that allows robust heat propagation.
+
+    Args:
+        neighbors: list of lists (mutated in place)
+        edge_lengths: dict (mutated in place)
+        centers: (N, 3) face centers in world space
+        engine_mask: (N,) bool array, True for engine-origin faces
+        max_pairs: max bridges per face in each direction
+        max_distance: max bridge distance (m, real scale)
+
+    Returns:
+        n_bridges: number of unique bridge edges added
+    """
+    n = len(centers)
+    eng_idx = np.where(engine_mask)[0]
+    ac_idx = np.where(~engine_mask)[0]
+
+    if len(eng_idx) == 0 or len(ac_idx) == 0:
+        return 0
+
+    ac_centers = centers[ac_idx]
+    eng_centers = centers[eng_idx]
+    added = set()
+
+    k_eng_to_ac = min(max_pairs, len(ac_idx))
+    k_ac_to_eng = min(max_pairs, len(eng_idx))
+
+    # Engine → body: every engine face connects to K nearest body faces
+    for ei in eng_idx:
+        dists = np.sum((ac_centers - centers[ei]) ** 2, axis=1)
+        order = np.argsort(dists)[:k_eng_to_ac]
+        for ni in order:
+            d = float(np.sqrt(dists[ni]))
+            if d < max_distance:
+                aj = int(ac_idx[ni])
+                key = (ei, aj) if ei < aj else (aj, ei)
+                added.add(key)
+
+    # Body → engine: body faces near engine connect back to K nearest engine faces
+    for ai in ac_idx:
+        dists = np.sum((eng_centers - centers[ai]) ** 2, axis=1)
+        min_d = float(np.sqrt(dists.min()))
+        if min_d > max_distance:
+            continue
+        order = np.argsort(dists)[:k_ac_to_eng]
+        for ni in order:
+            d = float(np.sqrt(dists[ni]))
+            if d < max_distance:
+                ej = int(eng_idx[ni])
+                key = (ai, ej) if ai < ej else (ej, ai)
+                added.add(key)
+
+    # Apply bridges
+    for (i, j) in added:
+        if j not in neighbors[i]:
+            neighbors[i].append(j)
+        if i not in neighbors[j]:
+            neighbors[j].append(i)
+        d = float(np.linalg.norm(centers[i] - centers[j]))
+        if d < 1e-9:
+            d = 1e-9
+        edge_lengths[(i, j)] = d
+        edge_lengths[(j, i)] = d
+
+    n_bridges = len(added)
+    if n_bridges > 0:
+        print(f"[bridge] 跨边界桥接: {n_bridges} 条边 "
+              f"(engine={len(eng_idx)}↔body={len(ac_idx)}, "
+              f"max_pairs={max_pairs}, max_dist={max_distance:.1f} m)")
+
+    return n_bridges
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 热平衡方程求解
 # ══════════════════════════════════════════════════════════════════════════════
@@ -433,14 +513,7 @@ def solve_heat_balance(T_o, L_N, A_j, q_o, T_amb, emissivity,
         return T_amb  # 辐射散热 ≥ 供热 → 环境温度
 
     if F(hi) >= 0.0:
-        # q_o 太大, 根在 T_o 以上 → 搜索上界
-        hi = T_o
-        for _ in range(50):
-            hi *= 1.5
-            if F(hi) <= 0.0 or hi > 10000.0:
-                break
-        if F(hi) >= 0.0:
-            return hi  # 饱和
+        return T_o  # 面片温度不会超过热源温度，饱和即 T_o
 
     for _ in range(300):
         mid = (lo + hi) * 0.5

@@ -126,32 +126,33 @@ def _setup_color_ramp(color_ramp, mode):
     els = color_ramp.color_ramp.elements
 
     if mode == "thermal":
-        # FLIR-style: blue → cyan → green → yellow → red
         els[0].position = 0.0
-        els[0].color = (0.0, 0.0, 0.5, 1.0)  # deep blue
+        els[0].color = (0.0, 0.0, 0.5, 1.0)
         els[1].position = 1.0
-        els[1].color = (1.0, 0.0, 0.0, 1.0)  # red
+        els[1].color = (1.0, 0.0, 0.0, 1.0)
 
         stops = [
-            (0.15, (0.0, 0.5, 1.0, 1.0)),   # cyan
-            (0.35, (0.0, 1.0, 0.0, 1.0)),   # green
-            (0.60, (1.0, 1.0, 0.0, 1.0)),   # yellow
-            (0.85, (1.0, 0.5, 0.0, 1.0)),   # orange
+            (0.15, (0.0, 0.5, 1.0, 1.0)),
+            (0.35, (0.0, 1.0, 0.0, 1.0)),
+            (0.60, (1.0, 1.0, 0.0, 1.0)),
+            (0.85, (1.0, 0.5, 0.0, 1.0)),
         ]
         for pos, color in stops:
             el = els.new(pos)
             el.color = color
 
     elif mode == "bw":
-        t = float(config.RENDER_BW_THRESHOLD)
-        g = float(config.RENDER_BW_BASE_GRAY)
-        els[0].position = 0.0
-        els[0].color = (g, g, g, 1.0)
-        # threshold stop: below this value everything stays flat gray
-        el_mid = els.new(t)
-        el_mid.color = (g + 0.02, g + 0.02, g + 0.02, 1.0)
+        min_gray = float(config.RENDER_BW_MIN_GRAY)
+        saturation = float(config.RENDER_BW_SATURATION)
+        gray_zone = float(config.RENDER_BW_GRAY_ZONE)
+
+        # 第一个色标移到 gray_zone 位置，创建灰色平台
+        # Map Range 输出 0~gray_zone → 灰色 (Color Ramp extrapolate/clamp)
+        # Map Range 输出 gray_zone~1 → 灰色渐变到白色
+        els[0].position = gray_zone
+        els[0].color = (min_gray, min_gray, min_gray, 1.0)
         els[1].position = 1.0
-        els[1].color = (1.0, 1.0, 1.0, 1.0)
+        els[1].color = (saturation, saturation, saturation, 1.0)
 
     else:
         raise ValueError(f"Unknown color mode: {mode}")
